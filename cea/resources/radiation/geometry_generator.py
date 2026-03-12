@@ -12,7 +12,7 @@ import os
 import pickle
 import time
 from itertools import repeat
-
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import py4design.py3dmodel.calculate as calculate
@@ -47,6 +47,7 @@ __status__ = "Production"
 
 from cea.utilities.standardize_coordinates import (get_lat_lon_projected_shapefile, get_projected_coordinate_system,
                                                    crs_to_epsg)
+from collections import defaultdict
 
 SURFACE_TYPES = ['walls', 'windows', 'roofs', 'undersides']
 SURFACE_DIRECTION_LABELS = {'windows_east',
@@ -271,14 +272,143 @@ def calc_building_geometry_surroundings(name: str,
     building_geometry.save(os.path.join(geometry_pickle_dir, 'surroundings', str(name)))
     return name
 
+def _iter_polygons(geometry):
+    """Yield Polygon objects from Polygon / MultiPolygon geometry."""
+    if geometry is None:
+        return
+    geom_type = getattr(geometry, "geom_type", None)
+    if geom_type == "Polygon":
+        yield geometry
+    elif geom_type == "MultiPolygon":
+        for poly in geometry.geoms:
+            yield poly
 
-def building_2d_to_3d(zone_df: gpd.GeoDataFrame, 
-                      surroundings_df: gpd.GeoDataFrame, 
-                      architecture_wwr_df: pd.DataFrame, 
-                      elevation_map: ElevationMap, 
-                      config: cea.config.Configuration, 
-                      geometry_pickle_dir: str
-                      ) -> Tuple[List[str], List[str]]:
+def _polygon_to_occ_face(poly):
+    """Convert a shapely Polygon with 3D coords to OCC face. Returns None if invalid."""
+    coords = list(poly.exterior.coords)
+    if len(coords) < 4:
+        return None
+
+    # Require XYZ input for roof tilt/orientation
+    if len(coords[0]) < 3:
+        return None
+
+    points = [(float(x), float(y), float(z)) for x, y, z, *_ in coords]
+    face = construct.make_polygon(points)
+
+    # Ensure normal points upward; flip winding if needed
+    n = calculate.face_normal(face)
+    if n[2] < 0:
+        points = list(reversed(points))
+        face = construct.make_polygon(points)
+
+    return face
+
+def load_custom_roof_faces(config, target_crs):
+    """
+    Load optional roof surfaces from:
+    <scenario>/inputs/building-geometry/roof_surfaces.geojson
+
+    Expected columns:
+    - building (str): building name matching zone 'name'
+    - geometry: Polygon/MultiPolygon with XYZ coords
+    """
+
+    roof_file = os.path.join(
+        config.scenario, "inputs", "building-geometry", "roof_surfaces.geojson"
+    )
+
+    if not os.path.exists(roof_file):
+        print(f"No custom roof file found at {roof_file}. Using default flat roofs.")
+        return {}
+
+    roof_gdf = gpd.read_file(roof_file)
+    if roof_gdf.empty:
+        print("Custom roof file is empty. Using default flat roofs.")
+        return {}
+
+    if "building" not in roof_gdf.columns:
+        raise ValueError("roof_surfaces.geojson must contain a 'building' column.")
+
+    if roof_gdf.crs is not None and target_crs is not None and roof_gdf.crs != target_crs:
+        roof_gdf = roof_gdf.to_crs(target_crs)
+
+    roofs_by_building = defaultdict(list)
+    skipped = 0
+
+    for _, row in roof_gdf.iterrows():
+        bname = row["building"]
+        if pd.isna(bname):
+            skipped += 1
+            continue
+
+        for poly in _iter_polygons(row.geometry):
+            face = _polygon_to_occ_face(poly)
+            if face is None:
+                skipped += 1
+                continue
+            roofs_by_building[str(bname)].append(face)
+
+    print(f"Loaded custom roofs for {len(roofs_by_building)} buildings. Skipped {skipped} faces.")
+    return dict(roofs_by_building)
+
+
+def _face_z_coordinates(face: TopoDS_Face) -> list[float]:
+    points = fetch.points_frm_occface(face)
+    z_values = []
+    for point in points:
+        if len(point) >= 3:
+            z_values.append(float(point[2]))
+    return z_values
+
+
+def _min_roof_z(roof_faces: list[TopoDS_Face]) -> float | None:
+    if not roof_faces:
+        return None
+    z_values = []
+    for face in roof_faces:
+        z_values.extend(_face_z_coordinates(face))
+    if not z_values:
+        return None
+    return float(min(z_values))
+
+
+def _translate_faces_in_z(roof_faces: list[TopoDS_Face], delta_z: float) -> list[TopoDS_Face]:
+    if abs(delta_z) <= 1e-9:
+        return list(roof_faces)
+
+    source = (0.0, 0.0, 0.0)
+    destination = (0.0, 0.0, float(delta_z))
+    translated = []
+    for face in roof_faces:
+        moved = modify.move(source, destination, face)
+        translated.append(fetch.topo2topotype(moved))
+    return translated
+
+
+def align_custom_roofs_to_default_roof_level(
+        custom_roofs: list[TopoDS_Face],
+        default_roofs: list[TopoDS_Face],
+) -> tuple[list[TopoDS_Face], float]:
+    """
+    Align custom roof faces so their base rests on the default OSM-derived roof level.
+
+    The default roof level comes from the original extruded building solid (before custom roof replacement).
+    """
+    default_roof_min_z = _min_roof_z(default_roofs)
+    custom_roof_min_z = _min_roof_z(custom_roofs)
+
+    if default_roof_min_z is None or custom_roof_min_z is None:
+        return list(custom_roofs), 0.0
+
+    delta_z = float(default_roof_min_z - custom_roof_min_z)
+    return _translate_faces_in_z(custom_roofs, delta_z), delta_z
+
+
+
+def building_2d_to_3d(zone_df, surroundings_df, architecture_wwr_df, elevation_map, config,
+                      geometry_pickle_dir, custom_roofs_by_building):
+
     """reconstruct 3D building geometries with windows and store each building's 3D data into a file.
 
     :param zone_df: data and 2D geometry of all analyzed building in the site, typically read from `zone.shp`.
@@ -312,6 +442,9 @@ def building_2d_to_3d(zone_df: gpd.GeoDataFrame,
 
     print('Calculating terrain intersection of building geometries')
     zone_buildings_df: pd.DataFrame = zone_df.set_index('name')
+    print(zone_df.head(),'zone_df')
+    print(zone_buildings_df.head(),'zone_buildings_df')
+
     # merge architecture wwr data into zone buildings dataframe with "name" column,
     # because we want to use void_deck when creating the building solid.
     zone_building_names = zone_buildings_df.index.values
@@ -348,12 +481,15 @@ def building_2d_to_3d(zone_df: gpd.GeoDataFrame,
         all_building_solid_list = []
     # TODO: maybe move calc_building_solid into this function and avoid using archiecture_wwr_df, because it's already merged into zone_buildings_df.
     geometry_3D_zone = calc_zone_geometry_multiprocessing(zone_building_names,
-                                                          zone_building_solid_list,
-                                                          repeat(all_building_solid_list, n),
-                                                          repeat(architecture_wwr_df, n),
-                                                          repeat(geometry_pickle_dir, n),
-                                                          repeat(neglect_adjacent_buildings, n),
-                                                          zone_elevations)
+                                                      zone_building_solid_list,
+                                                      repeat(all_building_solid_list, n),
+                                                      repeat(architecture_wwr_df, n),
+                                                      repeat(custom_roofs_by_building, n),
+                                                      repeat(geometry_pickle_dir, n),
+                                                      repeat(neglect_adjacent_buildings, n),
+                                                      zone_elevations)
+
+
 
     return geometry_3D_zone, geometry_3D_surroundings
 
@@ -416,14 +552,15 @@ class BuildingGeometry(object):
         return pickle_location
 
 
-def calc_building_geometry_zone(name: str, 
-                                building_solid: TopoDS_Solid, 
-                                all_building_solid_list: List[TopoDS_Solid], 
-                                architecture_wwr_df: gpd.GeoDataFrame,
-                                geometry_pickle_dir: str, 
-                                neglect_adjacent_buildings: bool, 
-                                elevation: float,
-                                ) -> str:
+def calc_building_geometry_zone(name,
+                                building_solid,
+                                all_building_solid_list,
+                                architecture_wwr_df,
+                                custom_roofs_by_building,
+                                geometry_pickle_dir,
+                                neglect_adjacent_buildings,
+                                elevation):
+
     """_summary_
 
     :param name: name of building.
@@ -476,6 +613,16 @@ def calc_building_geometry_zone(name: str,
     face_list = fetch.faces_frm_solid(building_solid)
     facade_list_north, facade_list_west, \
     facade_list_east, facade_list_south, roof_list, footprint_list = identify_surfaces_type(face_list)
+    default_roof_list = list(roof_list)
+
+    custom_roofs = custom_roofs_by_building.get(name, [])
+    if custom_roofs:
+        roof_list, z_shift_m = align_custom_roofs_to_default_roof_level(custom_roofs, default_roof_list)
+        if abs(z_shift_m) > 1e-6:
+            print(f"Aligned custom roofs for building {name} by {z_shift_m:.3f} m to match OSM roof level.")
+        print(f"Using {len(roof_list)} custom roof faces for building {name}")
+
+
 
     # get window properties
     wwr_west = float(architecture_wwr_df.loc[name, "wwr_west"])
@@ -901,7 +1048,9 @@ def geometry_main(config: cea.config.Configuration,
     """
     print("Standardizing coordinate systems")
     zone_df, surroundings_df, trees_df, terrain_raster = standardize_coordinate_systems(
-        zone_df, surroundings_df, trees_df, terrain_raster)
+    zone_df, surroundings_df, trees_df, terrain_raster)
+
+    custom_roofs_by_building = load_custom_roof_faces(config, zone_df.crs)
 
     # clear in case there are repeated buildings from zone in surroundings file
     filter_surrounding_buildings = ~surroundings_df["name"].isin(zone_df["name"])
@@ -917,8 +1066,8 @@ def geometry_main(config: cea.config.Configuration,
     # transform buildings 2D to 3D and add windows
     print("Creating 3D building surfaces")
     os.makedirs(geometry_pickle_dir, exist_ok=True)
-    geometry_3D_zone, geometry_3D_surroundings = building_2d_to_3d(zone_df, surroundings_df, architecture_wwr_df,
-                                                                   elevation_map, config, geometry_pickle_dir)
+    geometry_3D_zone, geometry_3D_surroundings = building_2d_to_3d(zone_df,surroundings_df,architecture_wwr_df,elevation_map,config,geometry_pickle_dir,custom_roofs_by_building)
+
 
     tree_surfaces = []
     if len(trees_df.geometry) > 0:

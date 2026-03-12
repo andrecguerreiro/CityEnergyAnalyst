@@ -228,7 +228,7 @@ def calc_pv_generation(sensor_groups, weather_data, date_local, solar_properties
         total_radiation_kWh[group] = (radiation_Wperm2['I_sol'] * tot_module_area_m2 / 1000)  # kWh
 
     # check for missing groups and assign 0 as el_output_PV_kW
-    # panel_orientations = ['walls_south', 'walls_north', 'roofs_top', 'walls_east', 'walls_west']
+    # panel_orientations = ['walls_south', s'walls_north', 'roofs_top', 'walls_east', 'walls_west']
     # for panel_orientation in panel_orientations:
     #     if panel_orientation not in prop_observers['type_orientation'].values:
     #         potential['PV_' + panel_orientation + '_E_kWh'] = 0

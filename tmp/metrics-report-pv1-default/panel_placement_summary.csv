@@ -1,0 +1,6 @@
+workflow_id,workflow_name,pv_panel,building,direction,tilt_bin_deg,panel_area_m2,panel_count_approx,share_of_panel_area,radiation_kWh_approx,share_of_radiation,E_PV_gen_kWh_approx,share_of_generation,missing_status
+WF0,workflow0_normal_flat_roofs,PV_PV1,B1000,S,30+,933.4,518.555556,1.0,1610734.02,1.0,255546.65,1.0,ok
+WF1,workflow1_geometry_generator,PV_PV1,B1000,E,5-15,1386.015006,770.008336,0.499438,2346157.852105,0.492629,311204.35973,0.492629,ok
+WF1,workflow1_geometry_generator,PV_PV1,B1000,W,5-15,1389.134994,771.741664,0.500562,2416365.947895,0.507371,320517.06027,0.507371,ok
+WF2,workflow2_remap_roof_metadata,PV_PV1,B1000,E,5-15,1386.0,770.0,0.499432,2391734.365345,0.499424,317579.648537,0.499424,ok
+WF2,workflow2_remap_roof_metadata,PV_PV1,B1000,W,5-15,1389.15,771.75,0.500568,2397250.414655,0.500576,318312.081463,0.500576,ok

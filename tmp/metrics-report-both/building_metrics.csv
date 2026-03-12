@@ -1,0 +1,13 @@
+workflow_id,workflow_name,pv_panel,building,pv_data_available,sensor_data_available,missing_status,E_PV_gen_kWh,area_PV_m2,aw_azimuth_deg,aw_tilt_deg,orientation_share_E,orientation_share_N,orientation_share_S,orientation_share_W,orientation_share_flat,radiation_kWh,radiation_kWh_m2,roof_area_m2,shading_cv_aw,shading_p90_p10_Whm2,specific_yield_kWh_m2
+WF0,workflow0_normal_flat_roofs,PV_PV1,B1000,True,True,ok,255546.65,933.4,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1610734.02,1725.663188,1749.6,0.000387,1606.76,273.780426
+WF0,workflow0_normal_flat_roofs,PV_PV2,B1000,True,True,ok,242886.02,933.4,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1610734.02,1725.663188,1749.6,0.000387,1606.76,260.216435
+WF0,workflow0_normal_flat_roofs,PV_PV3,B1000,True,True,ok,245029.65,933.4,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1610734.02,1725.663188,1749.6,0.000387,1606.76,262.513017
+WF0,workflow0_normal_flat_roofs,PV_PV4,B1000,True,True,ok,133236.93,933.4,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1610734.02,1725.663188,1749.6,0.000387,1606.76,142.743658
+WF1,workflow1_geometry_generator,PV_PV1,B1000,True,True,ok,631721.42,2775.15,90.017516,10.5,1.0,0.0,0.0,0.0,0.0,4762523.8,1716.132029,2775.16,0.013646,50235.26,227.635054
+WF1,workflow1_geometry_generator,PV_PV2,B1000,True,True,ok,599727.59,2775.15,90.017516,10.5,1.0,0.0,0.0,0.0,0.0,4762523.8,1716.132029,2775.16,0.013646,50235.26,216.106369
+WF1,workflow1_geometry_generator,PV_PV3,B1000,True,True,ok,604886.03,2775.15,90.017516,10.5,1.0,0.0,0.0,0.0,0.0,4762523.8,1716.132029,2775.16,0.013646,50235.26,217.965166
+WF1,workflow1_geometry_generator,PV_PV4,B1000,True,True,ok,330620.3,2775.15,90.017516,10.5,1.0,0.0,0.0,0.0,0.0,4762523.8,1716.132029,2775.16,0.013646,50235.26,119.136011
+WF2,workflow2_remap_roof_metadata,PV_PV1,B1000,True,True,ok,635891.73,2775.15,90.017684,10.5,1.0,0.0,0.0,0.0,0.0,4788984.78,1725.667002,2775.15,0.000424,2374.76,229.137787
+WF2,workflow2_remap_roof_metadata,PV_PV2,B1000,True,True,ok,603475.31,2775.15,90.017684,10.5,1.0,0.0,0.0,0.0,0.0,4788984.78,1725.667002,2775.15,0.000424,2374.76,217.456826
+WF2,workflow2_remap_roof_metadata,PV_PV3,B1000,True,True,ok,608716.93,2775.15,90.017684,10.5,1.0,0.0,0.0,0.0,0.0,4788984.78,1725.667002,2775.15,0.000424,2374.76,219.345596
+WF2,workflow2_remap_roof_metadata,PV_PV4,B1000,True,True,ok,332646.44,2775.15,90.017684,10.5,1.0,0.0,0.0,0.0,0.0,4788984.78,1725.667002,2775.15,0.000424,2374.76,119.866112
