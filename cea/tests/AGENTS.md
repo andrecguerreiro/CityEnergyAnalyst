@@ -5,6 +5,7 @@
 - `test_workflow_comparison_dashboard.py` - Validates workflow dashboard KPI extraction, delta logic, and Excel export.
 - `test_workflow_comparison_snapshots.py` - Validates workflow snapshot copying behaviour for optional geometry-pickle artefacts.
 - `test_workflow_geometry_comparison_3d.py` - Validates 3D geometry-comparison data loading, deterministic metadata downsampling, and plot generation smoke path.
+- `test_ucea.py` - Validates `cea ucea` orchestration flow, polygon capture fallbacks, stage-failure propagation, and comparison-root defaults.
 
 ## Key Patterns
 ### DO: Build synthetic fixtures in temp folders
@@ -28,6 +29,7 @@ write_pv_total_buildings(...)
 - `test_workflow_comparison_dashboard.py` - Dashboard reporting tests.
 - `test_workflow_comparison_snapshots.py` - Workflow snapshot artefact-copy tests.
 - `test_workflow_geometry_comparison_3d.py` - 3D workflow geometry-comparison tests.
+- `test_ucea.py` - End-to-end orchestration unit tests for geojson.io-driven runner behaviour.
 - `cea/resources/radiation/workflow_comparison_dashboard.py` - Reporting utility under test.
 - `cea/resources/radiation/workflow_comparison.py` - Snapshot helper under test.
 - `cea/resources/radiation/workflow_geometry_comparison_3d.py` - 3D comparison utility under test.

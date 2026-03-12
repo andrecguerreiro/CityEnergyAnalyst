@@ -575,6 +575,14 @@ default:
     module: cea.utilities.create_polygon
     parameters: ['general:scenario', create-polygon]
 
+  - name: ucea
+    label: UX Workflow Runner
+    short_description: Run geojson.io polygon capture and roof workflow comparison end-to-end
+    description: Run geojson.io polygon capture, scenario preparation scripts, workflow comparison, metrics report, and 3D check.
+    interfaces: [cli]
+    module: cea.resources.radiation.ucea
+    parameters: ['general:scenario', ucea]
+
   - name: compile
     label: compile
     short_description: Compile PYD files

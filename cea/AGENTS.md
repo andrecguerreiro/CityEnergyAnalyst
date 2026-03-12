@@ -120,3 +120,9 @@ def encode(self, value):
 - `config.pyi` - Type stubs (regenerate: `pixi run python cea/utilities/config_type_generator.py`)
 - `default.config` - Default values for all parameters
 - `interfaces/dashboard/api/tools.py` - Validation API endpoints (`validate_field`, `get_parameter_metadata`)
+
+## Script + Config Pattern
+
+- Register new CLI scripts in `scripts.yml` with `interfaces: [cli]` and a module exposing `main(config: Configuration)`.
+- Add a dedicated section in `default.config` for script options (example: `[ucea]`), using unique parameter names to avoid collisions with other sections.
+- Regenerate `config.pyi` after config schema changes.
