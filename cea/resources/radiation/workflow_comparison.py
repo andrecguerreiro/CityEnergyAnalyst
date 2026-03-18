@@ -1,14 +1,11 @@
 """
-Run three roof workflows for one CEA scenario and save comparable outputs.
+Run two roof workflows for one CEA scenario and save comparable outputs.
 
 Workflow 0:
     normal CEA flat roofs -> radiation -> photovoltaic
 
 Workflow 1:
     geometry_generator custom roofs -> radiation -> photovoltaic
-
-Workflow 2:
-    default flat-roof radiation metadata -> remap roof metadata -> photovoltaic
 """
 
 from __future__ import annotations
@@ -23,9 +20,8 @@ import sys
 
 WORKFLOW_0_NAME = "workflow0_normal_flat_roofs"
 WORKFLOW_1_NAME = "workflow1_geometry_generator"
-WORKFLOW_2_NAME = "workflow2_remap_roof_metadata"
 ROOF_REL_PATH = os.path.join("inputs", "building-geometry", "roof_surfaces.geojson")
-TEMP_ROOF_SUFFIX = ".disabled_for_workflow2"
+TEMP_ROOF_SUFFIX = ".disabled_for_workflow0"
 
 # Optional in-script defaults (edit these if you prefer running without CLI paths)
 DEFAULT_SCENARIO = r"C:\Users\Andre\cea-scenarios\test-case-north-south"
@@ -35,7 +31,7 @@ DEFAULT_COMPARISON_ROOT = r"C:\Users\Andre\cea-scenarios\test-case-north-south\o
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run three roof workflows for one scenario and archive outputs for comparison."
+        description="Run two roof workflows for one scenario and archive outputs for comparison."
     )
     parser.add_argument(
         "--scenario",
@@ -61,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-photovoltaic",
         action="store_true",
-        help="Run radiation/remap only and skip photovoltaic in all workflows.",
+        help="Run radiation only and skip photovoltaic in all workflows.",
     )
     parser.add_argument(
         "--pv-panel",
@@ -107,21 +103,6 @@ def run_cea_script(script_name: str, scenario: str, extra_args: list[str] | None
     ]
     if extra_args:
         command.extend(extra_args)
-    print("[run] " + " ".join(command))
-    subprocess.run(command, check=True)
-
-
-def run_remap_metadata(scenario: str, roof_file: str) -> None:
-    command = [
-        sys.executable,
-        "-m",
-        "cea.resources.radiation.remap_roof_metadata",
-        "--scenario",
-        scenario,
-        "--roof-file",
-        roof_file,
-        "--in-place",
-    ]
     print("[run] " + " ".join(command))
     subprocess.run(command, check=True)
 
@@ -232,25 +213,6 @@ def run_workflow_1(
     print(f"[done] Snapshot saved: {workflow_snapshot_root}")
 
 
-def run_workflow_2(
-    scenario: str,
-    roof_file: str,
-    workflow_snapshot_root: str,
-    run_photovoltaic: bool,
-    pv_panel: str,
-    include_insolation_feather: bool,
-    include_geometry_pickles: bool,
-) -> None:
-    print(f"\n=== {WORKFLOW_2_NAME} ===")
-
-    run_remap_metadata(scenario, roof_file)
-    if run_photovoltaic:
-        run_cea_script("photovoltaic", scenario, ["--panel-on-wall", "false", "--type-pvpanel", pv_panel])
-
-    snapshot_outputs(scenario, workflow_snapshot_root, include_insolation_feather, include_geometry_pickles)
-    print(f"[done] Snapshot saved: {workflow_snapshot_root}")
-
-
 def run_workflow_0(
     scenario: str,
     roof_file: str,
@@ -314,9 +276,7 @@ def main() -> None:
     run_photovoltaic = not args.skip_photovoltaic
     workflow_0_snapshot = os.path.join(comparison_root, WORKFLOW_0_NAME)
     workflow_1_snapshot = os.path.join(comparison_root, WORKFLOW_1_NAME)
-    workflow_2_snapshot = os.path.join(comparison_root, WORKFLOW_2_NAME)
-
-    print("Three-workflow run settings")
+    print("Two-workflow run settings")
     print(f"  scenario: {scenario}")
     print(f"  roof file: {roof_file}")
     print(f"  comparison root: {comparison_root}")
@@ -345,16 +305,6 @@ def main() -> None:
         include_geometry_pickles=args.include_geometry_pickles,
         clean_first=args.clean_first,
     )
-    run_workflow_2(
-        scenario=scenario,
-        roof_file=roof_file,
-        workflow_snapshot_root=workflow_2_snapshot,
-        run_photovoltaic=run_photovoltaic,
-        pv_panel=args.pv_panel,
-        include_insolation_feather=args.include_insolation_feather,
-        include_geometry_pickles=args.include_geometry_pickles,
-    )
-
     print("\nAll workflows completed.")
     print(f"Compare outputs under: {comparison_root}")
 

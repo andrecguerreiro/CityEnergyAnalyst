@@ -1,5 +1,5 @@
 """
-Visualise side-by-side 3D building geometry for workflow0/workflow1/workflow2.
+Visualise side-by-side 3D building geometry for workflow0/workflow1.
 
 Each workflow panel shows:
 - Full selected-building shell surfaces (walls, roofs, windows)
@@ -25,8 +25,7 @@ from cea.resources.radiation.geometry_generator import BuildingGeometry
 
 WORKFLOW_0 = "workflow0_normal_flat_roofs"
 WORKFLOW_1 = "workflow1_geometry_generator"
-WORKFLOW_2 = "workflow2_remap_roof_metadata"
-WORKFLOWS = [WORKFLOW_0, WORKFLOW_1, WORKFLOW_2]
+WORKFLOWS = [WORKFLOW_0, WORKFLOW_1]
 
 DEFAULT_SCENARIO = r"C:\Users\Andre\cea-scenarios\test-case"
 DEFAULT_COMPARISON_ROOT = r"C:\Users\Andre\cea-scenarios\test-case\outputs\data\roof-workflow-comparison"
@@ -52,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--comparison-root",
         default="",
         help=(
-            "Path to one workflow comparison folder containing workflow0/workflow1/workflow2. "
+            "Path to one workflow comparison folder containing workflow0/workflow1. "
             "Default: <scenario>/outputs/data/roof-workflow-comparison."
         ),
     )
@@ -336,13 +335,13 @@ def create_figure(
     show: bool,
 ) -> None:
     bounds = collect_bounds(workflow_data)
-    fig = plt.figure(figsize=(21, 7))
-    axes = [fig.add_subplot(1, 3, i + 1, projection="3d") for i in range(3)]
+    figure_width = 7 * len(WORKFLOWS)
+    fig = plt.figure(figsize=(figure_width, 7))
+    axes = [fig.add_subplot(1, len(WORKFLOWS), i + 1, projection="3d") for i in range(len(WORKFLOWS))]
 
     titles = {
         WORKFLOW_0: "Workflow 0 - Normal flat roofs",
         WORKFLOW_1: "Workflow 1 - Geometry generator",
-        WORKFLOW_2: "Workflow 2 - Remap metadata",
     }
 
     for ax, workflow in zip(axes, WORKFLOWS):

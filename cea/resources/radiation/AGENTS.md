@@ -3,8 +3,7 @@
 ## Main API
 - `main(config: Configuration) -> None` in `main.py` - Runs the CEA radiation pipeline.
 - `geometry_main(...) -> tuple` in `geometry_generator.py` - Builds terrain/building geometry and writes `BuildingGeometry` pickles.
-- `main()` in `remap_roof_metadata.py` - Remaps roof metadata for workflow2 without rerunning radiation.
-- `main()` in `workflow_comparison.py` - Runs workflow0/workflow1/workflow2 and snapshots outputs (optional `--include-geometry-pickles`).
+- `main()` in `workflow_comparison.py` - Runs workflow0/workflow1 and snapshots outputs (optional `--include-geometry-pickles`).
 - `main()` in `workflow_geometry_comparison_3d.py` - 3D side-by-side workflow geometry visualiser for one building.
 - `main()` in `workflow_metrics_report.py` - Generates scenario/building metrics and explicit WF deltas from workflow snapshots.
 - `main(config: Configuration)` in `ucea.py` - Runs geojson.io polygon capture, scenario helpers, workflow comparison, metrics report, and 3D check in one CLI command.
@@ -68,11 +67,9 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - `daysim.py` - Sensor generation and simulation execution.
 - `radiance.py` - Radiance geometry/material writing.
 - `main.py` - Radiation entry point.
-- `remap_roof_metadata.py` - Metadata-only roof remap.
-- `workflow_comparison.py` - Three-workflow runner and snapshot utility.
+- `workflow_comparison.py` - Two-workflow runner and snapshot utility.
 - `workflow_geometry_comparison_3d.py` - Side-by-side 3D geometry comparison.
 - `workflow1_geometry_generator_documentation.txt` - Workflow1 reference notes.
-- `workflow2_remap_roof_metadata_documentation.txt` - Workflow2 reference notes.
 - `workflow_metrics_report.py` - Scenario/building KPI and delta report utility.
 
 ## Script Defaults
