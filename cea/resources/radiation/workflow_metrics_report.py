@@ -18,6 +18,7 @@ import csv
 import glob
 import math
 import os
+import time
 from typing import Any, Iterable
 
 
@@ -44,10 +45,9 @@ ROOF_METRICS = [
     "panel_area_installed_m2",
     "aw_tilt_deg",
     "aw_surface_tilt_deg",
+    "aw_surface_azimuth_deg",
     "aw_panel_tilt_deg_area",
     "aw_panel_tilt_deg_module",
-    "aw_azimuth_deg",
-    "aw_panel_azimuth_deg_area",
     "aw_panel_azimuth_deg_module",
     "orientation_share_flat",
     "orientation_share_N",
@@ -61,9 +61,14 @@ ROOF_METRICS = [
     "panel_orientation_share_W",
     "shading_cv_aw",
     "shading_p90_p10_Whm2",
+    "shading_cv_aw_detrended",
+    "shading_p90_p10_ratio_detrended",
 ]
 
 ALL_METRICS = PV_METRICS + ROOF_METRICS
+
+DEFAULT_FLAT_PANEL_AZIMUTH_DEG = 180.0
+PANEL_AZIMUTH_OFFSET_DEG = 0.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         default=1.8,
         type=float,
         help="Approximate module area for panel count estimation (count = area_installed_module_m2 / this value).",
+    )
+    parser.add_argument(
+        "--undo-pv-azimuth-harmonisation",
+        action="store_true",
+        help=(
+            "Rotate non-flat panel azimuth bins by +180° to undo temporary PV azimuth harmonisation applied "
+            "before PV runs in workflow comparison."
+        ),
     )
     return parser.parse_args()
 
@@ -176,6 +189,74 @@ def read_building_totals(path: str) -> dict[str, dict[str, float]]:
     return out
 
 
+def load_building_heights(workflow_root: str) -> dict[str, float]:
+    """
+    Estimate building height from workflow geometry metadata.
+
+    Height is computed as:
+    - max roof sensor Z minus min underside sensor Z, when both are available
+    - otherwise max roof sensor Z minus terrain elevation, when available
+    """
+    solar_root = os.path.join(workflow_root, "solar-radiation")
+    if not os.path.isdir(solar_root):
+        return {}
+
+    heights: dict[str, float] = {}
+    for path in glob.glob(os.path.join(solar_root, "*_geometry.csv")):
+        filename = os.path.basename(path)
+        if not filename.endswith("_geometry.csv"):
+            continue
+        building = filename.replace("_geometry.csv", "")
+        rows_iter = iter_csv_rows(path)
+        try:
+            header = next(rows_iter)
+        except StopIteration:
+            continue
+
+        def idx(name: str) -> int:
+            try:
+                return header.index(name)
+            except ValueError as exc:
+                raise ValueError(f"Missing column '{name}' in {path}") from exc
+
+        i_type = idx("TYPE")
+        i_z = idx("Zcoor")
+        i_terrain = idx("terrain_elevation")
+
+        max_roof_z: float | None = None
+        min_underside_z: float | None = None
+        terrain_elevation: float | None = None
+
+        for row in rows_iter:
+            if len(row) <= max(i_type, i_z, i_terrain):
+                continue
+            type_name = row[i_type].strip().lower()
+            z_value = to_float(row[i_z])
+            terrain_value = to_float(row[i_terrain])
+
+            if terrain_elevation is None and terrain_value is not None:
+                terrain_elevation = terrain_value
+
+            if z_value is None:
+                continue
+
+            if type_name == "roofs":
+                max_roof_z = z_value if max_roof_z is None else max(max_roof_z, z_value)
+            elif type_name == "undersides":
+                min_underside_z = z_value if min_underside_z is None else min(min_underside_z, z_value)
+
+        height: float | None = None
+        if max_roof_z is not None and min_underside_z is not None:
+            height = max_roof_z - min_underside_z
+        elif max_roof_z is not None and terrain_elevation is not None:
+            height = max_roof_z - terrain_elevation
+
+        if height is not None and height >= 0:
+            heights[building] = height
+
+    return heights
+
+
 def quadrant(azimuth_deg: float) -> str:
     az = azimuth_deg % 360.0
     if az < 45.0 or az >= 315.0:
@@ -196,14 +277,40 @@ def true_azimuth_from_normal(xdir: float, ydir: float) -> float:
     return azimuth
 
 
-def tilt_bin_label(panel_tilt_deg: float) -> str:
-    if panel_tilt_deg < 5.0:
-        return "0-5"
-    if panel_tilt_deg < 15.0:
-        return "5-15"
-    if panel_tilt_deg < 30.0:
-        return "15-30"
-    return "30+"
+def panel_azimuth_deg(
+    xdir: float,
+    ydir: float,
+    panel_tilt_deg: float,
+    surface_azimuth_deg: float | None = None,
+    flat_panel_azimuth_deg: float = DEFAULT_FLAT_PANEL_AZIMUTH_DEG,
+) -> float | None:
+    if abs(panel_tilt_deg) <= 1e-6:
+        return None
+    # Use the normal-based azimuth for non-flat rows, then apply optional convention offset.
+    if abs(xdir) > 1e-9 or abs(ydir) > 1e-9:
+        return (true_azimuth_from_normal(xdir, ydir) + PANEL_AZIMUTH_OFFSET_DEG) % 360.0
+    # Flat roof surfaces often have (xdir, ydir) = (0, 0), but panels are mounted with a tilt.
+    # In that case, use the convention that panel rows face south by default.
+    if surface_azimuth_deg is None:
+        return flat_panel_azimuth_deg % 360.0
+    return (surface_azimuth_deg + PANEL_AZIMUTH_OFFSET_DEG) % 360.0
+
+
+def surface_azimuth_deg_adjusted(
+    xdir: float,
+    ydir: float,
+    surface_tilt_deg: float,
+    surface_azimuth_deg: float | None = None,
+) -> float | None:
+    if abs(surface_tilt_deg) <= 1e-6:
+        if surface_azimuth_deg is None:
+            return None
+        return surface_azimuth_deg % 360.0
+    if abs(xdir) > 1e-9 or abs(ydir) > 1e-9:
+        return (true_azimuth_from_normal(xdir, ydir) + PANEL_AZIMUTH_OFFSET_DEG) % 360.0
+    if surface_azimuth_deg is None:
+        return None
+    return (surface_azimuth_deg + PANEL_AZIMUTH_OFFSET_DEG) % 360.0
 
 
 def weighted_quantile(values: list[float], weights: list[float], q: float) -> float:
@@ -228,6 +335,97 @@ def weighted_quantile(values: list[float], weights: list[float], q: float) -> fl
     return pairs[-1][0]
 
 
+def weighted_circular_mean_deg(values_deg: list[float], weights: list[float]) -> float | None:
+    if not values_deg:
+        return None
+    if len(values_deg) != len(weights):
+        raise ValueError("Values and weights length mismatch.")
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return None
+
+    sin_sum = 0.0
+    cos_sum = 0.0
+    for azimuth_deg, weight in zip(values_deg, weights):
+        angle_rad = math.radians(azimuth_deg % 360.0)
+        sin_sum += weight * math.sin(angle_rad)
+        cos_sum += weight * math.cos(angle_rad)
+
+    if abs(sin_sum) <= 1e-12 and abs(cos_sum) <= 1e-12:
+        return None
+
+    mean_deg = math.degrees(math.atan2(sin_sum, cos_sum))
+    if mean_deg < 0:
+        mean_deg += 360.0
+    return mean_deg
+
+
+def compute_detrended_shading_stats(roof_rows: list[dict[str, Any]]) -> tuple[float | None, float | None]:
+    # Remove first-order geometry effects (tilt + orientation) before computing spread.
+    # This keeps WF comparisons focused on shading heterogeneity, not different roof aspect mixes.
+    bucket_weighted_radiation: dict[tuple[str, float], float] = {}
+    bucket_weighted_area: dict[tuple[str, float], float] = {}
+
+    for row in roof_rows:
+        area = row["AREA_m2"]
+        if area <= 0:
+            continue
+        panel_azimuth = panel_azimuth_deg(
+            row["Xdir"],
+            row["Ydir"],
+            row["B_deg"],
+            surface_azimuth_deg=row["surface_azimuth_deg"],
+        )
+        direction = "flat" if panel_azimuth is None else quadrant(panel_azimuth)
+        tilt_bucket_deg = 0.0 if abs(row["B_deg"]) <= 1e-6 else round(row["B_deg"] / 5.0) * 5.0
+        bucket = (direction, tilt_bucket_deg)
+        bucket_weighted_radiation[bucket] = bucket_weighted_radiation.get(bucket, 0.0) + row["total_rad_Whm2"] * area
+        bucket_weighted_area[bucket] = bucket_weighted_area.get(bucket, 0.0) + area
+
+    bucket_mean_radiation = {
+        bucket: bucket_weighted_radiation[bucket] / area
+        for bucket, area in bucket_weighted_area.items()
+        if area > 0
+    }
+    if not bucket_mean_radiation:
+        return None, None
+
+    detrended_values: list[float] = []
+    detrended_weights: list[float] = []
+    for row in roof_rows:
+        area = row["AREA_m2"]
+        if area <= 0:
+            continue
+        panel_azimuth = panel_azimuth_deg(
+            row["Xdir"],
+            row["Ydir"],
+            row["B_deg"],
+            surface_azimuth_deg=row["surface_azimuth_deg"],
+        )
+        direction = "flat" if panel_azimuth is None else quadrant(panel_azimuth)
+        tilt_bucket_deg = 0.0 if abs(row["B_deg"]) <= 1e-6 else round(row["B_deg"] / 5.0) * 5.0
+        bucket = (direction, tilt_bucket_deg)
+        bucket_mean = bucket_mean_radiation.get(bucket)
+        if bucket_mean is None or bucket_mean <= 0:
+            continue
+        detrended_values.append(row["total_rad_Whm2"] / bucket_mean)
+        detrended_weights.append(area)
+
+    if not detrended_values:
+        return None, None
+
+    total_weight = sum(detrended_weights)
+    if total_weight <= 0:
+        return None, None
+
+    detrended_mean = sum(v * w for v, w in zip(detrended_values, detrended_weights)) / total_weight
+    detrended_var = sum(((v - detrended_mean) ** 2) * w for v, w in zip(detrended_values, detrended_weights)) / total_weight
+    detrended_cv = float("nan") if detrended_mean <= 0 else math.sqrt(detrended_var) / detrended_mean
+    p10 = weighted_quantile(detrended_values, detrended_weights, 0.10)
+    p90 = weighted_quantile(detrended_values, detrended_weights, 0.90)
+    return detrended_cv, (p90 - p10)
+
+
 def compute_sensor_stats(sensor_rows: list[dict[str, Any]]) -> dict[str, float] | None:
     if not sensor_rows:
         return None
@@ -244,18 +442,18 @@ def compute_sensor_stats(sensor_rows: list[dict[str, Any]]) -> dict[str, float] 
 
     aw_surface_tilt = sum(row["tilt_deg"] * row["AREA_m2"] for row in roof_rows) / roof_area
     aw_panel_tilt_area = sum(row["B_deg"] * row["AREA_m2"] for row in roof_rows) / roof_area
-    aw_panel_azimuth_area = sum(row["surface_azimuth_deg"] * row["AREA_m2"] for row in roof_rows) / roof_area
+
     if module_area > 0:
         aw_panel_tilt_module = sum(row["B_deg"] * row["area_installed_module_m2"] for row in roof_rows) / module_area
-        aw_panel_azimuth_module = (
-            sum(row["surface_azimuth_deg"] * row["area_installed_module_m2"] for row in roof_rows) / module_area
-        )
     else:
         aw_panel_tilt_module = None
-        aw_panel_azimuth_module = None
 
     orient_areas = {"flat": 0.0, "N": 0.0, "E": 0.0, "S": 0.0, "W": 0.0}
     panel_orient_areas = {"flat": 0.0, "N": 0.0, "E": 0.0, "S": 0.0, "W": 0.0}
+    surface_azimuth_values_deg: list[float] = []
+    surface_azimuth_weights_m2: list[float] = []
+    panel_azimuth_values_deg: list[float] = []
+    panel_azimuth_weights_m2: list[float] = []
     radiation_values: list[float] = []
     radiation_weights: list[float] = []
     for row in roof_rows:
@@ -266,13 +464,35 @@ def compute_sensor_stats(sensor_rows: list[dict[str, Any]]) -> dict[str, float] 
         if abs(surface_tilt) <= 1e-6:
             orient_areas["flat"] += area
         else:
-            orient_areas[quadrant(row["surface_azimuth_deg"])] += area
+            surface_azimuth = surface_azimuth_deg_adjusted(
+                row["Xdir"],
+                row["Ydir"],
+                surface_tilt,
+                row["surface_azimuth_deg"],
+            )
+            if surface_azimuth is None:
+                continue
+            orient_areas[quadrant(surface_azimuth)] += area
+            surface_azimuth_values_deg.append(surface_azimuth)
+            surface_azimuth_weights_m2.append(area)
 
         panel_tilt = row["B_deg"]
         if abs(panel_tilt) <= 1e-6:
             panel_orient_areas["flat"] += module
         else:
-            panel_orient_areas[quadrant(row["surface_azimuth_deg"])] += module
+            panel_azimuth = panel_azimuth_deg(
+                row["Xdir"],
+                row["Ydir"],
+                panel_tilt,
+                surface_azimuth_deg=row["surface_azimuth_deg"],
+            )
+            if panel_azimuth is None:
+                panel_orient_areas["flat"] += module
+            else:
+                panel_orient_areas[quadrant(panel_azimuth)] += module
+                if module > 0:
+                    panel_azimuth_values_deg.append(panel_azimuth)
+                    panel_azimuth_weights_m2.append(module)
 
         radiation_values.append(row["total_rad_Whm2"])
         radiation_weights.append(area)
@@ -282,19 +502,21 @@ def compute_sensor_stats(sensor_rows: list[dict[str, Any]]) -> dict[str, float] 
     shading_cv = float("nan") if rad_mean <= 0 else math.sqrt(rad_var) / rad_mean
     p10 = weighted_quantile(radiation_values, radiation_weights, 0.10)
     p90 = weighted_quantile(radiation_values, radiation_weights, 0.90)
+    shading_cv_detrended, shading_ratio_spread_detrended = compute_detrended_shading_stats(roof_rows)
+    aw_surface_azimuth_deg = weighted_circular_mean_deg(surface_azimuth_values_deg, surface_azimuth_weights_m2)
+    aw_panel_azimuth_deg_module = weighted_circular_mean_deg(panel_azimuth_values_deg, panel_azimuth_weights_m2)
 
     return {
         "roof_area_m2": roof_area,
         "panel_area_installed_m2": module_area,
-        # Backwards-compatible aliases
+        # Backwards-compatible alias
         "aw_tilt_deg": aw_surface_tilt,
-        "aw_azimuth_deg": aw_panel_azimuth_area,
-        # Explicit surface vs panel metrics
+        # Explicit surface vs panel tilt metrics
         "aw_surface_tilt_deg": aw_surface_tilt,
+        "aw_surface_azimuth_deg": aw_surface_azimuth_deg,
         "aw_panel_tilt_deg_area": aw_panel_tilt_area,
         "aw_panel_tilt_deg_module": aw_panel_tilt_module,
-        "aw_panel_azimuth_deg_area": aw_panel_azimuth_area,
-        "aw_panel_azimuth_deg_module": aw_panel_azimuth_module,
+        "aw_panel_azimuth_deg_module": aw_panel_azimuth_deg_module,
         "orientation_area_flat_m2": orient_areas["flat"],
         "orientation_area_N_m2": orient_areas["N"],
         "orientation_area_E_m2": orient_areas["E"],
@@ -312,6 +534,8 @@ def compute_sensor_stats(sensor_rows: list[dict[str, Any]]) -> dict[str, float] 
         "panel_orientation_share_W": None if module_area <= 0 else panel_orient_areas["W"] / module_area,
         "shading_cv_aw": shading_cv,
         "shading_p90_p10_Whm2": p90 - p10,
+        "shading_cv_aw_detrended": shading_cv_detrended,
+        "shading_p90_p10_ratio_detrended": shading_ratio_spread_detrended,
     }
 
 
@@ -396,10 +620,12 @@ def parse_numeric_row(
     key_fields: dict[str, Any],
     pv_metrics: dict[str, float] | None,
     sensor_metrics: dict[str, float] | None,
+    building_height_m: float | None = None,
 ) -> dict[str, Any]:
     row = dict(key_fields)
     row["pv_data_available"] = pv_metrics is not None
     row["sensor_data_available"] = sensor_metrics is not None
+    row["building_height_m"] = building_height_m
     if not pv_metrics and not sensor_metrics:
         row["missing_status"] = "missing_pv_and_sensors"
     elif not pv_metrics:
@@ -448,19 +674,15 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
                 )
                 / roof_area_sum
             )
+            aw_surface_azimuth_deg = weighted_circular_mean_deg(
+                [r["aw_surface_azimuth_deg"] for r in sensor_valid if r["aw_surface_azimuth_deg"] is not None],
+                [r["roof_area_m2"] for r in sensor_valid if r["aw_surface_azimuth_deg"] is not None and r["roof_area_m2"] is not None],
+            )
             aw_panel_tilt_area = (
                 sum(
                     r["aw_panel_tilt_deg_area"] * r["roof_area_m2"]
                     for r in sensor_valid
                     if r["aw_panel_tilt_deg_area"] is not None
-                )
-                / roof_area_sum
-            )
-            aw_panel_az_area = (
-                sum(
-                    r["aw_panel_azimuth_deg_area"] * r["roof_area_m2"]
-                    for r in sensor_valid
-                    if r["aw_panel_azimuth_deg_area"] is not None
                 )
                 / roof_area_sum
             )
@@ -517,10 +739,26 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
                 )
                 / roof_area_sum
             )
+            shading_cv_detrended = (
+                sum(
+                    r["shading_cv_aw_detrended"] * r["roof_area_m2"]
+                    for r in sensor_valid
+                    if r["shading_cv_aw_detrended"] is not None
+                )
+                / roof_area_sum
+            )
+            shading_ratio_spread_detrended = (
+                sum(
+                    r["shading_p90_p10_ratio_detrended"] * r["roof_area_m2"]
+                    for r in sensor_valid
+                    if r["shading_p90_p10_ratio_detrended"] is not None
+                )
+                / roof_area_sum
+            )
         else:
             aw_surface_tilt = None
+            aw_surface_azimuth_deg = None
             aw_panel_tilt_area = None
-            aw_panel_az_area = None
             share_flat = None
             share_n = None
             share_e = None
@@ -528,6 +766,8 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
             share_w = None
             shading_cv = None
             shading_spread = None
+            shading_cv_detrended = None
+            shading_ratio_spread_detrended = None
 
         if panel_area_installed_sum > 0:
             aw_panel_tilt_module = (
@@ -538,13 +778,13 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
                 )
                 / panel_area_installed_sum
             )
-            aw_panel_az_module = (
-                sum(
-                    r["aw_panel_azimuth_deg_module"] * r["panel_area_installed_m2"]
+            aw_panel_azimuth_deg_module = weighted_circular_mean_deg(
+                [r["aw_panel_azimuth_deg_module"] for r in sensor_valid if r["aw_panel_azimuth_deg_module"] is not None],
+                [
+                    r["panel_area_installed_m2"]
                     for r in sensor_valid
                     if r["aw_panel_azimuth_deg_module"] is not None and r["panel_area_installed_m2"] is not None
-                )
-                / panel_area_installed_sum
+                ],
             )
             panel_share_flat = (
                 sum(
@@ -588,7 +828,7 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
             )
         else:
             aw_panel_tilt_module = None
-            aw_panel_az_module = None
+            aw_panel_azimuth_deg_module = None
             panel_share_flat = None
             panel_share_n = None
             panel_share_e = None
@@ -612,11 +852,10 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
             "panel_area_installed_m2": panel_area_installed_sum if sensor_valid else None,
             "aw_tilt_deg": aw_surface_tilt,
             "aw_surface_tilt_deg": aw_surface_tilt,
+            "aw_surface_azimuth_deg": aw_surface_azimuth_deg,
             "aw_panel_tilt_deg_area": aw_panel_tilt_area,
             "aw_panel_tilt_deg_module": aw_panel_tilt_module,
-            "aw_azimuth_deg": aw_panel_az_area,
-            "aw_panel_azimuth_deg_area": aw_panel_az_area,
-            "aw_panel_azimuth_deg_module": aw_panel_az_module,
+            "aw_panel_azimuth_deg_module": aw_panel_azimuth_deg_module,
             "orientation_share_flat": share_flat,
             "orientation_share_N": share_n,
             "orientation_share_E": share_e,
@@ -629,6 +868,8 @@ def aggregate_scenario_rows(building_rows: list[dict[str, Any]]) -> list[dict[st
             "panel_orientation_share_W": panel_share_w,
             "shading_cv_aw": shading_cv,
             "shading_p90_p10_Whm2": shading_spread,
+            "shading_cv_aw_detrended": shading_cv_detrended,
+            "shading_p90_p10_ratio_detrended": shading_ratio_spread_detrended,
             "n_buildings_with_pv_data": len(pv_valid),
             "n_buildings_with_sensor_data": len(sensor_valid),
         }
@@ -663,7 +904,7 @@ def build_panel_placement_rows(
                             "pv_panel": panel,
                             "building": building,
                             "direction": "",
-                            "tilt_bin_deg": "",
+                            "tilt_deg": None,
                             "panel_area_m2": None,
                             "panel_count_approx": None,
                             "share_of_panel_area": None,
@@ -673,12 +914,18 @@ def build_panel_placement_rows(
                 continue
 
             base_panel_area = sum(row["area_installed_module_m2"] for row in roof_rows)
-            bins: dict[tuple[str, str], dict[str, float]] = {}
+            bins: dict[tuple[str, float], dict[str, float]] = {}
             for sensor in roof_rows:
                 panel_tilt = sensor["B_deg"]
-                true_azimuth = true_azimuth_from_normal(sensor["Xdir"], sensor["Ydir"])
-                direction = quadrant(true_azimuth)
-                bin_key = (direction, tilt_bin_label(panel_tilt))
+                true_azimuth = panel_azimuth_deg(
+                    sensor["Xdir"],
+                    sensor["Ydir"],
+                    panel_tilt,
+                    surface_azimuth_deg=sensor["surface_azimuth_deg"],
+                )
+                direction = "flat" if true_azimuth is None else quadrant(true_azimuth)
+                # Round for stable grouping and cleaner CSV output.
+                bin_key = (direction, round(float(panel_tilt), 6))
                 if bin_key not in bins:
                     bins[bin_key] = {"panel_area_m2": 0.0, "radiation_weight_Wh": 0.0}
                 module_area = sensor["area_installed_module_m2"]
@@ -697,7 +944,7 @@ def build_panel_placement_rows(
                             "pv_panel": panel,
                             "building": building,
                             "direction": "",
-                            "tilt_bin_deg": "",
+                            "tilt_deg": None,
                             "panel_area_m2": None,
                             "panel_count_approx": None,
                             "share_of_panel_area": None,
@@ -716,7 +963,7 @@ def build_panel_placement_rows(
                 total_radiation = panel_metrics.get("radiation_kWh")
                 total_generation = panel_metrics.get("E_PV_gen_kWh")
 
-                for (direction, tilt_bin), bin_data in sorted(bins.items()):
+                for (direction, tilt_deg), bin_data in sorted(bins.items()):
                     panel_area = bin_data["panel_area_m2"] * scale
                     panel_count = None if approx_panel_area_m2 <= 0 else panel_area / approx_panel_area_m2
                     share = None if target_panel_area <= 0 else panel_area / target_panel_area
@@ -730,7 +977,7 @@ def build_panel_placement_rows(
                             "pv_panel": panel,
                             "building": building,
                             "direction": direction,
-                            "tilt_bin_deg": tilt_bin,
+                            "tilt_deg": tilt_deg,
                             "panel_area_m2": panel_area,
                             "panel_count_approx": panel_count,
                             "share_of_panel_area": share,
@@ -787,13 +1034,47 @@ def round_for_output(value: Any) -> Any:
     return value
 
 
-def write_csv(path: str, rows: list[dict[str, Any]], field_order: list[str]) -> None:
+def write_csv(path: str, rows: list[dict[str, Any]], field_order: list[str]) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as fp:
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=field_order, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: round_for_output(row.get(field)) for field in field_order})
+        return path
+    except PermissionError:
+        pass
+
+    # Windows-friendly fallback when target CSV is open (e.g., in Excel):
+    # write to a timestamped sibling file instead of failing the entire run.
+    stem, ext = os.path.splitext(path)
+    fallback_path = f"{stem}.locked_{int(time.time())}{ext}"
+    try:
+        with open(fallback_path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=field_order, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: round_for_output(row.get(field)) for field in field_order})
+        print(f"[warn] Could not overwrite locked file: {path}")
+        print(f"[warn] Wrote metrics to fallback file instead: {fallback_path}")
+        return fallback_path
+    except PermissionError:
+        pass
+
+    # Final fallback: write into project-local tmp folder if output directory itself is not writable.
+    basename = os.path.basename(path)
+    local_tmp_dir = os.path.join(os.getcwd(), "tmp", "workflow_metrics_fallback")
+    os.makedirs(local_tmp_dir, exist_ok=True)
+    local_fallback_path = os.path.join(local_tmp_dir, f"{basename}.locked_{int(time.time())}")
+    with open(local_fallback_path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=field_order, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow({field: round_for_output(row.get(field)) for field in field_order})
+    print(f"[warn] Could not overwrite locked or non-writable file: {path}")
+    print(f"[warn] Wrote metrics to local fallback file instead: {local_fallback_path}")
+    return local_fallback_path
 
 
 def build_field_order(rows: list[dict[str, Any]], preferred_first: list[str]) -> list[str]:
@@ -805,7 +1086,9 @@ def build_field_order(rows: list[dict[str, Any]], preferred_first: list[str]) ->
 
 
 def main() -> None:
+    global PANEL_AZIMUTH_OFFSET_DEG
     args = parse_args()
+    PANEL_AZIMUTH_OFFSET_DEG = 180.0 if args.undo_pv_azimuth_harmonisation else 0.0
     comparison_root = os.path.abspath(args.comparison_root)
     if not os.path.isdir(comparison_root):
         raise NotADirectoryError(f"Comparison root does not exist: {comparison_root}")
@@ -829,6 +1112,7 @@ def main() -> None:
             "workflow_name": folder_name,
             "sensor_stats": sensor_stats,
             "sensor_raw_rows": raw_sensor_rows,
+            "building_heights": load_building_heights(workflow_root),
             "panel_totals": panel_totals,
         }
 
@@ -844,6 +1128,7 @@ def main() -> None:
     for workflow_id, wf_data in workflow_data.items():
         workflow_name = wf_data["workflow_name"]
         sensor_stats = wf_data["sensor_stats"]
+        building_heights = wf_data["building_heights"]
         for panel in panels:
             pv_totals = wf_data["panel_totals"][panel]
             for building in sorted(all_buildings):
@@ -855,7 +1140,14 @@ def main() -> None:
                     "pv_panel": panel,
                     "building": building,
                 }
-                building_rows.append(parse_numeric_row(key_fields, pv_metrics, roof_metrics))
+                building_rows.append(
+                    parse_numeric_row(
+                        key_fields,
+                        pv_metrics,
+                        roof_metrics,
+                        building_height_m=building_heights.get(building),
+                    )
+                )
 
     scenario_rows = aggregate_scenario_rows(building_rows)
     scenario_delta_rows = build_delta_rows(scenario_rows, key_fields=["pv_panel"])
@@ -888,9 +1180,9 @@ def main() -> None:
         )
         path_metrics = os.path.join(out_dir, "scenario_metrics.csv")
         path_deltas = os.path.join(out_dir, "scenario_deltas.csv")
-        write_csv(path_metrics, scenario_rows, scenario_metrics_fields)
-        write_csv(path_deltas, scenario_delta_rows, scenario_delta_fields)
-        outputs_written.extend([path_metrics, path_deltas])
+        written_metrics = write_csv(path_metrics, scenario_rows, scenario_metrics_fields)
+        written_deltas = write_csv(path_deltas, scenario_delta_rows, scenario_delta_fields)
+        outputs_written.extend([written_metrics, written_deltas])
 
     if args.level in ("building", "both"):
         building_metrics_fields = build_field_order(
@@ -900,6 +1192,7 @@ def main() -> None:
                 "workflow_name",
                 "pv_panel",
                 "building",
+                "building_height_m",
                 "pv_data_available",
                 "sensor_data_available",
                 "missing_status",
@@ -911,9 +1204,9 @@ def main() -> None:
         )
         path_metrics = os.path.join(out_dir, "building_metrics.csv")
         path_deltas = os.path.join(out_dir, "building_deltas.csv")
-        write_csv(path_metrics, building_rows, building_metrics_fields)
-        write_csv(path_deltas, building_delta_rows, building_delta_fields)
-        outputs_written.extend([path_metrics, path_deltas])
+        written_metrics = write_csv(path_metrics, building_rows, building_metrics_fields)
+        written_deltas = write_csv(path_deltas, building_delta_rows, building_delta_fields)
+        outputs_written.extend([written_metrics, written_deltas])
 
     if args.level in ("building", "both"):
         panel_placement_fields = [
@@ -922,7 +1215,7 @@ def main() -> None:
             "pv_panel",
             "building",
             "direction",
-            "tilt_bin_deg",
+            "tilt_deg",
             "panel_area_m2",
             "panel_count_approx",
             "share_of_panel_area",
@@ -933,8 +1226,8 @@ def main() -> None:
             "missing_status",
         ]
         path_panel_placement = os.path.join(out_dir, "panel_placement_summary.csv")
-        write_csv(path_panel_placement, panel_placement_rows, panel_placement_fields)
-        outputs_written.append(path_panel_placement)
+        written_panel_placement = write_csv(path_panel_placement, panel_placement_rows, panel_placement_fields)
+        outputs_written.append(written_panel_placement)
 
     print("Workflow metrics report completed.")
     print(f"comparison_root: {comparison_root}")

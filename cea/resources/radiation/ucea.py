@@ -24,39 +24,56 @@ DEFAULT_GEOJSON_URL = "https://geojson.io/#map=18.2/38.708267/-9.138085"
 ROOF_RELATIVE_PATH = os.path.join("inputs", "building-geometry", "roof_surfaces.geojson")
 DEFAULT_ROOF_SURFACES_GEOJSON = {
   "type": "FeatureCollection",
-  "name": "roof_surfaces",
-  "crs": { "type": "name", "properties": { "name": "EPSG:32629" } },
+  "name": "tilted_roof",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:EPSG::32629"
+    }
+  },
   "features": [
     {
       "type": "Feature",
-      "properties": { "building": "B1000", "roof_id": "r_WSW_10" },
+      "properties": {
+        "building": "B1000",
+        "roof_id": "1"
+      },
       "geometry": {
         "type": "Polygon",
-        "coordinates": [[
-          [488013.263, 4284392.486, 74.500000],
-          [487990.108, 4284385.149, 70.000000],
-          [487974.198, 4284437.936, 69.787491],
-          [487998.547, 4284445.259, 74.500000],
-          [488013.263, 4284392.486, 74.500000]
-        ]]
-      }
-    },
-    {
-      "type": "Feature",
-      "properties": { "building": "B1000", "roof_id": "r_ENE_10" },
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [[
-          [487998.547, 4284445.259, 74.500000],
-          [488021.804, 4284452.254, 70.000000],
-          [488037.716, 4284400.235, 69.748958],
-          [488013.263, 4284392.486, 74.500000],
-          [487998.547, 4284445.259, 74.500000]
-        ]]
+        "coordinates": [
+          [
+            [
+              469440.6180762463,
+              4282452.974460124,
+              23.5
+            ],
+            [
+              469450.15954341384,
+              4282451.218962209,
+              23.5
+            ],
+            [
+              469448.3828239006,
+              4282441.56077624,
+              16.722939852573275
+            ],
+            [
+              469438.83958826656,
+              4282443.328358676,
+              16.730921007557723
+            ],
+            [
+              469440.6180762463,
+              4282452.974460124,
+              23.5
+            ]
+          ]
+        ]
       }
     }
   ]
 }
+
 
 
 class UceaStageError(RuntimeError):
@@ -297,7 +314,13 @@ def _prepare_site_polygon(config: Configuration, coordinates: list[tuple[float, 
 def _run_data_preparation(config: Configuration) -> None:
     _call_api("database_helper", config, databases_path=config.ucea.database_path)
     _call_api("zone_helper", config)
-    _call_api("surroundings_helper", config, buffer=config.ucea.surroundings_buffer_m)
+    if config.ucea.run_surroundings_helper:
+        _call_api("surroundings_helper", config, buffer=config.ucea.surroundings_buffer_m)
+    else:
+        _log(
+            "Skipping surroundings-helper and keeping existing surroundings geometry at "
+            "inputs/geometry/surroundings.shp."
+        )
     _call_api("terrain_helper", config, buffer=config.ucea.terrain_buffer_m)
     _call_api("weather_helper", config, weather=config.ucea.weather_source)
     _call_api("archetypes_mapper", config)
@@ -355,8 +378,10 @@ def _run_experiments(config: Configuration, scenario: str) -> UceaRuntime:
             "--comparison-root",
             comparison_root,
             "--include-geometry-pickles",
+            "--clean-first",
             "--pv-panel",
             pv_panel,
+            "--harmonise-pv-azimuth-convention",
         ],
     )
 
@@ -369,6 +394,7 @@ def _run_experiments(config: Configuration, scenario: str) -> UceaRuntime:
             "both",
             "--pv-panels",
             pv_panel,
+            "--undo-pv-azimuth-harmonisation",
         ],
     )
 

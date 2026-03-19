@@ -16,17 +16,22 @@ import os
 import shutil
 import subprocess
 import sys
+import math
+import time
+
+import pandas as pd
 
 
 WORKFLOW_0_NAME = "workflow0_normal_flat_roofs"
 WORKFLOW_1_NAME = "workflow1_geometry_generator"
 ROOF_REL_PATH = os.path.join("inputs", "building-geometry", "roof_surfaces.geojson")
 TEMP_ROOF_SUFFIX = ".disabled_for_workflow0"
+TEMP_PV_AZIMUTH_BACKUP_SUFFIX = ".pv_azimuth_convention_backup"
 
 # Optional in-script defaults (edit these if you prefer running without CLI paths)
-DEFAULT_SCENARIO = r"C:\Users\Andre\cea-scenarios\test-case-north-south"
-DEFAULT_ROOF_FILE = r"C:\Users\Andre\cea-scenarios\test-case-north-south\inputs\building-geometry\roof_surfaces.geojson"
-DEFAULT_COMPARISON_ROOT = r"C:\Users\Andre\cea-scenarios\test-case-north-south\outputs\data\roof-workflow-comparison"
+DEFAULT_SCENARIO = r"C:\Users\Andre\cea-scenarios\test-tilt"
+DEFAULT_ROOF_FILE = r"C:\Users\Andre\cea-scenarios\test-tilt\inputs\building-geometry\roof_surfaces.geojson"
+DEFAULT_COMPARISON_ROOT = r"C:\Users\Andre\cea-scenarios\test-tilt\outputs\data\roof-workflow-comparison"
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +90,26 @@ def parse_args() -> argparse.Namespace:
             "before each radiation run (workflow 0 and workflow 1)."
         ),
     )
+    parser.add_argument(
+        "--harmonise-pv-azimuth-convention",
+        action="store_true",
+        default=True,
+        dest="harmonise_pv_azimuth_convention",
+        help=(
+            "Before each photovoltaic run, rotate sloped-roof metadata normals by 180° in XY so panel azimuth "
+            "is in the same convention frame expected by the current PV AOI path. Metadata is restored afterwards. "
+            "Default: enabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-harmonise-pv-azimuth-convention",
+        action="store_false",
+        dest="harmonise_pv_azimuth_convention",
+        help=(
+            "Disable temporary PV azimuth harmonisation and run photovoltaic with geometry metadata as generated "
+            "by radiation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -114,7 +139,7 @@ def clean_outputs(scenario: str) -> None:
     ]
     for target in targets:
         if os.path.isdir(target):
-            shutil.rmtree(target)
+            _rmtree_with_retries(target)
             print(f"[clean] Removed: {target}")
 
 
@@ -122,9 +147,28 @@ def prepare_comparison_root(comparison_root: str) -> None:
     if os.path.isfile(comparison_root):
         raise FileExistsError(f"Comparison root points to a file, not a folder: {comparison_root}")
     if os.path.isdir(comparison_root):
-        shutil.rmtree(comparison_root)
-        print(f"[clean] Removed existing comparison root: {comparison_root}")
+        try:
+            _rmtree_with_retries(comparison_root)
+            print(f"[clean] Removed existing comparison root: {comparison_root}")
+        except PermissionError:
+            archived = f"{comparison_root}.locked_{int(time.time())}"
+            os.replace(comparison_root, archived)
+            print(f"[warn] Comparison root was locked and could not be deleted: {comparison_root}")
+            print(f"[warn] Moved locked root to: {archived}")
     os.makedirs(comparison_root, exist_ok=True)
+
+
+def _rmtree_with_retries(path: str, retries: int = 5, delay_seconds: float = 0.5) -> None:
+    last_error: Exception | None = None
+    for _ in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
 
 
 def ensure_no_stale_disabled_roof(roof_file: str) -> None:
@@ -164,6 +208,66 @@ def copy_matching_files(source_folder: str, destination_folder: str, patterns: l
                 shutil.copy2(source_path, destination_path)
 
 
+def _list_geometry_csvs(scenario: str) -> list[str]:
+    solar_radiation_folder = os.path.join(scenario, "outputs", "data", "solar-radiation")
+    return sorted(glob.glob(os.path.join(solar_radiation_folder, "*_geometry.csv")))
+
+
+def apply_temp_pv_azimuth_convention_harmonisation(scenario: str) -> list[tuple[str, str]]:
+    geometry_paths = _list_geometry_csvs(scenario)
+    backups: list[tuple[str, str]] = []
+    if not geometry_paths:
+        print("[info] No geometry CSV files found for temporary PV azimuth convention harmonisation.")
+        return backups
+
+    changed_rows = 0
+    changed_files = 0
+    for path in geometry_paths:
+        backup_path = path + TEMP_PV_AZIMUTH_BACKUP_SUFFIX
+        if os.path.exists(backup_path):
+            raise FileExistsError(
+                f"Temporary PV azimuth backup already exists: {backup_path}. "
+                "Restore or remove backup files before running again."
+            )
+        shutil.copy2(path, backup_path)
+        backups.append((path, backup_path))
+
+        df = pd.read_csv(path)
+        required = {"TYPE", "Xdir", "Ydir", "Zdir"}
+        if not required.issubset(df.columns):
+            continue
+
+        roof_mask = df["TYPE"].astype(str).str.lower() == "roofs"
+        zdir = pd.to_numeric(df["Zdir"], errors="coerce").clip(-1.0, 1.0)
+        tilt_deg = zdir.apply(lambda z: math.degrees(math.acos(z)) if pd.notna(z) else float("nan"))
+        sloped_roof_mask = roof_mask & (tilt_deg >= 5.0)
+        if not sloped_roof_mask.any():
+            continue
+
+        df.loc[sloped_roof_mask, "Xdir"] = -pd.to_numeric(df.loc[sloped_roof_mask, "Xdir"], errors="coerce")
+        df.loc[sloped_roof_mask, "Ydir"] = -pd.to_numeric(df.loc[sloped_roof_mask, "Ydir"], errors="coerce")
+        df.to_csv(path, index=False)
+        changed_files += 1
+        changed_rows += int(sloped_roof_mask.sum())
+
+    print(
+        f"[step] Applied temporary PV azimuth convention harmonisation: "
+        f"{changed_rows} sloped-roof rows changed across {changed_files} geometry files."
+    )
+    return backups
+
+
+def restore_geometry_metadata_from_backups(backups: list[tuple[str, str]]) -> None:
+    restored = 0
+    for original_path, backup_path in backups:
+        if not os.path.exists(backup_path):
+            continue
+        shutil.move(backup_path, original_path)
+        restored += 1
+    if restored:
+        print(f"[step] Restored original geometry metadata from {restored} temporary backup files.")
+
+
 def snapshot_outputs(
     scenario: str,
     workflow_snapshot_root: str,
@@ -200,6 +304,7 @@ def run_workflow_1(
     include_insolation_feather: bool,
     include_geometry_pickles: bool,
     clean_first: bool,
+    harmonise_pv_azimuth_convention: bool,
 ) -> None:
     print(f"\n=== {WORKFLOW_1_NAME} ===")
     if clean_first:
@@ -207,7 +312,14 @@ def run_workflow_1(
 
     run_cea_script("radiation", scenario)
     if run_photovoltaic:
-        run_cea_script("photovoltaic", scenario, ["--panel-on-wall", "false", "--type-pvpanel", pv_panel])
+        backups: list[tuple[str, str]] = []
+        try:
+            if harmonise_pv_azimuth_convention:
+                backups = apply_temp_pv_azimuth_convention_harmonisation(scenario)
+            run_cea_script("photovoltaic", scenario, ["--panel-on-wall", "false", "--type-pvpanel", pv_panel])
+        finally:
+            if backups:
+                restore_geometry_metadata_from_backups(backups)
 
     snapshot_outputs(scenario, workflow_snapshot_root, include_insolation_feather, include_geometry_pickles)
     print(f"[done] Snapshot saved: {workflow_snapshot_root}")
@@ -222,6 +334,7 @@ def run_workflow_0(
     include_insolation_feather: bool,
     include_geometry_pickles: bool,
     clean_first: bool,
+    harmonise_pv_azimuth_convention: bool,
 ) -> None:
     print(f"\n=== {WORKFLOW_0_NAME} ===")
     if clean_first:
@@ -234,7 +347,14 @@ def run_workflow_0(
         restore_roof_file(roof_file, disabled_path)
 
     if run_photovoltaic:
-        run_cea_script("photovoltaic", scenario, ["--panel-on-wall", "false", "--type-pvpanel", pv_panel])
+        backups: list[tuple[str, str]] = []
+        try:
+            if harmonise_pv_azimuth_convention:
+                backups = apply_temp_pv_azimuth_convention_harmonisation(scenario)
+            run_cea_script("photovoltaic", scenario, ["--panel-on-wall", "false", "--type-pvpanel", pv_panel])
+        finally:
+            if backups:
+                restore_geometry_metadata_from_backups(backups)
 
     snapshot_outputs(scenario, workflow_snapshot_root, include_insolation_feather, include_geometry_pickles)
     print(f"[done] Snapshot saved: {workflow_snapshot_root}")
@@ -285,6 +405,7 @@ def main() -> None:
     print(f"  include insolation feather: {args.include_insolation_feather}")
     print(f"  include geometry pickles: {args.include_geometry_pickles}")
     print(f"  clean first: {args.clean_first}")
+    print(f"  harmonise pv azimuth convention: {args.harmonise_pv_azimuth_convention}")
 
     run_workflow_1(
         scenario=scenario,
@@ -294,6 +415,7 @@ def main() -> None:
         include_insolation_feather=args.include_insolation_feather,
         include_geometry_pickles=args.include_geometry_pickles,
         clean_first=args.clean_first,
+        harmonise_pv_azimuth_convention=args.harmonise_pv_azimuth_convention,
     )
     run_workflow_0(
         scenario=scenario,
@@ -304,6 +426,7 @@ def main() -> None:
         include_insolation_feather=args.include_insolation_feather,
         include_geometry_pickles=args.include_geometry_pickles,
         clean_first=args.clean_first,
+        harmonise_pv_azimuth_convention=args.harmonise_pv_azimuth_convention,
     )
     print("\nAll workflows completed.")
     print(f"Compare outputs under: {comparison_root}")

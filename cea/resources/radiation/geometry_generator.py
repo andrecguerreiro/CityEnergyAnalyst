@@ -283,6 +283,35 @@ def _iter_polygons(geometry):
         for poly in geometry.geoms:
             yield poly
 
+
+def _project_points_to_best_fit_plane(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]] | None:
+    """
+    Project polygon vertices to a single best-fit plane to guarantee planarity for OCC face creation.
+    """
+    if len(points) < 3:
+        return None
+
+    points_array = np.asarray(points, dtype=float)
+    if points_array.shape[1] != 3:
+        return None
+
+    centroid = points_array.mean(axis=0)
+    centered = points_array - centroid
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if len(singular_values) < 3:
+        return None
+
+    normal = vh[-1]
+    normal_norm = float(np.linalg.norm(normal))
+    if normal_norm <= 1e-12:
+        return None
+    normal = normal / normal_norm
+
+    distances = centered @ normal
+    projected = points_array - np.outer(distances, normal)
+    return [tuple(float(v) for v in point) for point in projected]
+
+
 def _polygon_to_occ_face(poly):
     """Convert a shapely Polygon with 3D coords to OCC face. Returns None if invalid."""
     coords = list(poly.exterior.coords)
@@ -293,14 +322,35 @@ def _polygon_to_occ_face(poly):
     if len(coords[0]) < 3:
         return None
 
-    points = [(float(x), float(y), float(z)) for x, y, z, *_ in coords]
-    face = construct.make_polygon(points)
+    raw_points = [(float(x), float(y), float(z)) for x, y, z, *_ in coords]
+
+    # Remove ring closure point before geometric processing.
+    if raw_points[0] == raw_points[-1]:
+        raw_points = raw_points[:-1]
+    if len(raw_points) < 3:
+        return None
+
+    planar_points = _project_points_to_best_fit_plane(raw_points)
+    if planar_points is None or len(planar_points) < 3:
+        return None
+
+    points = planar_points + [planar_points[0]]
+    try:
+        face = construct.make_polygon(points)
+    except Exception:
+        return None
 
     # Ensure normal points upward; flip winding if needed
-    n = calculate.face_normal(face)
+    try:
+        n = calculate.face_normal(face)
+    except Exception:
+        return None
     if n[2] < 0:
         points = list(reversed(points))
-        face = construct.make_polygon(points)
+        try:
+            face = construct.make_polygon(points)
+        except Exception:
+            return None
 
     return face
 

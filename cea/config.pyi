@@ -1482,6 +1482,7 @@ class UceaSection(Section):
     """Typed section for ucea configuration"""
     database_path: str
     surroundings_buffer_m: float
+    run_surroundings_helper: bool
     terrain_buffer_m: float
     weather_source: str
     pv_panel: Any
@@ -1495,6 +1496,8 @@ class UceaSection(Section):
     def __getattr__(self, item: Literal["database_path"]) -> str: ...
     @overload
     def __getattr__(self, item: Literal["surroundings_buffer_m"]) -> float: ...
+    @overload
+    def __getattr__(self, item: Literal["run_surroundings_helper"]) -> bool: ...
     @overload
     def __getattr__(self, item: Literal["terrain_buffer_m"]) -> float: ...
     @overload
