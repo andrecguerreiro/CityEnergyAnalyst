@@ -1,0 +1,1 @@
+workflow_id,workflow_name,pv_panel,building,direction,tilt_deg,panel_area_m2,panel_count_approx,share_of_panel_area,radiation_kWh_approx,share_of_radiation,E_PV_gen_kWh_approx,share_of_generation,missing_status
