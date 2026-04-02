@@ -113,3 +113,6 @@ setup/Dependencies/cityenergyanalyst.tar.gz
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+cea/resources/radiation/INE_com_NPAV_norm0.gpkg 
+ultralytics/INE_building_height.gpkg 
+cea/resources/radiation/INE_com_NPAV_norm0.gpkg 

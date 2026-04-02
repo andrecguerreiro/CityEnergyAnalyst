@@ -327,7 +327,15 @@ class TerrainHelperSection(Section):
 class SurroundingsHelperSection(Section):
     """Typed section for surroundings-helper configuration"""
     buffer: float
+    building_height_gpkg: str | None
+    ine_fallback_max_distance_m: float
 
+    @overload
+    def __getattr__(self, item: Literal["buffer"]) -> float: ...
+    @overload
+    def __getattr__(self, item: Literal["building_height_gpkg"]) -> str | None: ...
+    @overload
+    def __getattr__(self, item: Literal["ine_fallback_max_distance_m"]) -> float: ...
     def __getattr__(self, item: str) -> Any: ...
 
 class ZoneHelperSection(Section):
@@ -340,6 +348,8 @@ class ZoneHelperSection(Section):
     occupancy_type: str
     include_building_parts: bool
     fix_overlapping_geometries: bool
+    building_height_gpkg: str | None
+    ine_fallback_max_distance_m: float
 
     @overload
     def __getattr__(self, item: Literal["height_ag"]) -> float | None: ...
@@ -357,6 +367,10 @@ class ZoneHelperSection(Section):
     def __getattr__(self, item: Literal["include_building_parts"]) -> bool: ...
     @overload
     def __getattr__(self, item: Literal["fix_overlapping_geometries"]) -> bool: ...
+    @overload
+    def __getattr__(self, item: Literal["building_height_gpkg"]) -> str | None: ...
+    @overload
+    def __getattr__(self, item: Literal["ine_fallback_max_distance_m"]) -> float: ...
     def __getattr__(self, item: str) -> Any: ...
 
 class TreesHelperSection(Section):
@@ -1487,6 +1501,7 @@ class UceaSection(Section):
     weather_source: str
     pv_panel: Any
     comparison_root: Any
+    workflow1_only: bool
     building_3d: Any
     polygon_timeout_minutes: float
     open_browser: bool
@@ -1506,6 +1521,8 @@ class UceaSection(Section):
     def __getattr__(self, item: Literal["pv_panel"]) -> Any: ...
     @overload
     def __getattr__(self, item: Literal["comparison_root"]) -> Any: ...
+    @overload
+    def __getattr__(self, item: Literal["workflow1_only"]) -> bool: ...
     @overload
     def __getattr__(self, item: Literal["building_3d"]) -> Any: ...
     @overload

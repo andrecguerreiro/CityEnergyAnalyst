@@ -15,6 +15,7 @@ from shapely import MultiPolygon
 
 import cea.config
 import cea.inputlocator
+from cea.datamanagement.height_enrichment import enrich_building_heights_from_gpkg, apply_surroundings_floor_validity_guard
 from cea.datamanagement.zone_helper import parse_building_floors, clean_geometries
 from cea.demand import constants
 from cea.utilities.standardize_coordinates import get_projected_coordinate_system, get_geographic_coordinate_system, \
@@ -149,6 +150,8 @@ def geometry_extractor_osm(locator, config):
 
     # local variables:
     buffer_m = config.surroundings_helper.buffer
+    building_height_gpkg = config.surroundings_helper.building_height_gpkg
+    ine_fallback_max_distance_m = config.surroundings_helper.ine_fallback_max_distance_m
     shapefile_out_path = locator.get_surroundings_geometry()
     zone = gdf.from_file(locator.get_zone_geometry())
 
@@ -179,6 +182,13 @@ def geometry_extractor_osm(locator, config):
         result = clean_attributes(surroundings, key="CEA")
         result = result.to_crs(get_projected_coordinate_system(float(lat), float(lon)))
         result = clean_geometries(result)
+        result = enrich_building_heights_from_gpkg(
+            buildings=result,
+            building_height_gpkg=building_height_gpkg,
+            fallback_max_distance_m=ine_fallback_max_distance_m,
+            reference_column="REFERENCE",
+        )
+        result = apply_surroundings_floor_validity_guard(result)
 
     # save to shapefile
     result.to_file(shapefile_out_path)

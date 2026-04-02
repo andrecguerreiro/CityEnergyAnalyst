@@ -1,0 +1,1605 @@
+This file describes my approach to add extra outputs to each bounding box prediction in the ultralytics pipelines.
+
+Goal: Find roofs inside images, where I want to predict their area, their height, their inclination
+
+Modifications:
+
+1- add a structure inside the cfg/models/11 to add a yolo11-roof.yaml that uses our custom things
+
+```yaml
+nc: 1 # there are only roofs
+scales: # what is this? no clue
+  n: [0.50, 0.25, 1024] # summary: 196 layers, 2695747 parameters, 2695731 gradients, 6.9 GFLOPs
+  s: [0.50, 0.50, 1024] # summary: 196 layers, 9744931 parameters, 9744915 gradients, 22.7 GFLOPs
+  m: [0.50, 1.00, 512] # summary: 246 layers, 20963523 parameters, 20963507 gradients, 72.2 GFLOPs
+  l: [1.00, 1.00, 512] # summary: 372 layers, 26220995 parameters, 26220979 gradients, 91.3 GFLOPs
+  x: [1.00, 1.50, 512] # summary: 372 layers, 58875331 parameters, 58875315 gradients, 204.3 GFLOPs
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+# YOLO11n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C3k2, [512, False]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C3k2, [256, False]] # 16 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C3k2, [512, False]] # 19 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large)
+
+  - [[16, 19, 22], 1, RoofDetect, [nc,3]] # I detect three parameters related with area, height, inclination
+```
+1.1. Add the class RoofDetect to the head.py file inside the nn/modules/head.py file, which connects with the previous yaml file 
+
+```python
+class RoofDetect(Detect):
+    """
+    YOLO Roof detection head for roof attributes (area, height, inclination).
+
+    This class mirrors the OBB detect head: it extends the Detect head and adds `ne`
+    extra regression channels produced per spatial location (anchors). Those `ne`
+    channels are returned as a separate tensor during training and concatenated to
+    the detection output during inference/export.
+
+    Args:
+        nc (int): number of classes (default 1 for roofs).
+        ne (int): number of extra regression outputs per anchor (default 3:
+                  area, height, inclination).
+        ch (tuple): channels for backbone feature maps (e.g. (256,512,1024)).
+    """
+
+    def __init__(self, nc: int = 1, ne: int = 3, ch: tuple = ()):
+        super().__init__(nc, ch)            # initialize parent Detect (anchors, nl, stride, etc.)
+        self.nc = int(nc)
+        self.ne = int(ne)                  # number of extra outputs per anchor
+
+        self.reg_max = int(getattr(self, "reg_max", 1))
+
+        # total outputs per anchor: reg_max*4 (bbox) + nc (classes) + ne (extras)
+        self.no = self.reg_max * 4 + self.nc + self.ne
+
+        # build small conv stacks (one per feature map in ch) that output `ne` channels
+        c4 = max(ch[0] // 4, self.ne, 8)
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(
+                Conv(in_ch, c4, 3),
+                Conv(c4, c4, 3),
+                nn.Conv2d(c4, self.ne, 1)
+            ) for in_ch in ch
+        )
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
+        """
+        Forward pass.
+
+        Inputs:
+            x: list of feature maps from backbone (length self.nl)
+
+        Returns:
+            - training: (detect_out, extras) where extras.shape == (bs, ne, total_cells)
+            - inference/export:
+                * if Detect.forward returns a single tensor, extras are concat'd on dim=1
+                * else if Detect.forward returns a tuple, extras are concatenated to the first element
+        """
+        bs = x[0].shape[0]
+
+        # produce extras per scale and flatten spatial dims -> (bs, ne, H*W)
+        extras_per_scale = [self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)]
+        extras = torch.cat(extras_per_scale, dim=2)  # (bs, ne, sum(H*W))
+
+        # Optional mapping (kept as in OBB): map logits -> angle range
+        # This line mirrors your OBB mapping; if you want to keep raw logits remove it.
+        # Here it's applied to all extras; if only inclination is angular you can map only that channel later.
+        extras = (extras.sigmoid() - 0.25) * math.pi  # maps to approximately [-pi/4, 3pi/4]
+
+        # store for inference convenience (same pattern as OBB)
+        if not self.training:
+            self.extras = extras
+
+        # get base detect outputs from parent
+        detect_out = Detect.forward(self, x)
+
+        # training: return detect outputs and extras separately for the loss to consume
+        if self.training:
+            return detect_out, extras
+
+        # inference/export: append extras to the main prediction tensor(s)
+        if isinstance(detect_out, torch.Tensor):
+            return torch.cat([detect_out, extras], dim=1)
+
+        if isinstance(detect_out, (tuple, list)):
+            main = detect_out[0]
+            rest = tuple(detect_out[1:]) if len(detect_out) > 1 else ()
+            main_with_extras = torch.cat([main, extras], dim=1)
+            if rest:
+                return (main_with_extras, *rest)
+            return main_with_extras
+
+        return detect_out
+
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor):
+        """
+        Decode bounding boxes using the extras stored on forward.
+        """
+        if not hasattr(self, "extras"):
+            raise RuntimeError("decode_bboxes expects `self.extras` to be set. Run forward() first in eval mode.")
+        area, height, inclination = self.extras[:,0,:], self.extras[:,1,:], self.extras[:,2,:]
+    
+        return torch.cat([bboxes, area.unsqueeze(1), height.unsqueeze(1), inclination.unsqueeze(1)], dim=1)
+```
+
+we also need to forward declare the following in the nn/modules/head.py
+
+```py
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "RoofDetect"
+```
+
+change the file ultralytics\nn\tasks.py with the following forward declaration
+
+```py
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "YOLOEDetect", "YOLOESegment", "RoofDetect"
+```
+
+change the file ultralytics\nn\modules\__init__.py with the following forward declaration
+
+```py
+from ultralytics.nn.modules import (
+...
+    C3TR,
+    ELAN1,
+    OBB,
+    RoofDetect, # this line 
+    PSA,
+    SPP,
+    SPPELAN,
+...
+)
+```
+
+lastly also change the following in  ultralytics\nn\tasks.py with the following forward declaration
+
+```py
+return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB,RoofDetect)) else self.forward(x)
+```
+
+5. I also added custom losses to the file utils/loss.py throught the following 
+
+```python
+class v8RoofLoss(v8DetectionLoss):
+    """Criterion class for computing training losses for YOLOv8 roof detection."""
+    def __init__(self, model, tal_topk: int = 10):
+        """Initialize v8RoofLoss with model parameters and task-aligned assignment settings."""
+        super().__init__(model, tal_topk)
+        # Add loss functions for extra attributes
+        self.loss_area = nn.MSELoss()
+        self.loss_height = nn.MSELoss()
+        self.loss_inclination = lambda pred, target: 1 - torch.cos(pred - target).mean()
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate the sum of the loss for box, cls, dfl, and extra roof attributes.
+        Returns: total_loss, (loss_box, loss_cls, loss_dfl, loss_area, loss_height, loss_inclination)
+        """
+        # --- Step 1: Separate standard detection outputs and extras ---
+        if isinstance(preds, tuple):
+            feats_enlarged, pred_extras = preds  # feats: standard detection outputs, pred_extras: area, height, inclination
+        else:
+            # If not a tuple, assume preds is the concatenated output (standard + extras)
+            # Split into standard detection outputs and extras
+            feats_enlarged = preds[:, :, :-self.ne]  # Strip last `self.ne` channels (extras)
+            pred_extras = preds[:, :, -self.ne:]  # Last `self.ne` channels are extras
+
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl
+        feats = feats_enlarged[1] if isinstance(feats_enlarged, tuple) else feats_enlarged
+
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+        # Targets
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        # Pboxes
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
+        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
+
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        target_scores_sum = max(target_scores.sum(), 1)
+
+        # Cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+        # Bbox loss
+        if fg_mask.sum():
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+            )
+
+        bs, ne , n_preds= pred_extras.shape
+        device = batch["extras"].device
+
+        # target_gt_idx: (bs, n_preds) mapping pred -> gt index (may contain -1 or 0-as-background)
+        tg_idx = target_gt_idx.long()
+
+        # vectorized gather of GT extras per prediction
+        ar = torch.arange(bs, device=device).unsqueeze(1).expand(bs, n_preds)    # (bs, n_preds)
+        safe_idx = tg_idx.clamp(min=0)                                           # avoid -1
+        target_per_pred = batch["extras"][ar, safe_idx]                           # (bs, n_preds, ne)
+        # zero-out unmatched predictions (where tg_idx < 0)
+        target_per_pred[tg_idx < 0] = 0.0
+
+        # normalize fg mask to (bs, n_preds)
+        fg_bool = fg_mask.squeeze(-1) if fg_mask.dim() == 3 and fg_mask.shape[2] == 1 else fg_mask.bool()
+        # pred_extras is (bs, ne, n_preds) -> convert to (bs, n_preds, ne)
+        if pred_extras.dim() == 3 and pred_extras.shape[1] == ne:
+            pred_extras = pred_extras.permute(0, 2, 1).contiguous()  # -> (bs, n_preds, ne)
+        # compute extras loss only on positives (safely handle zero positives)
+        if fg_bool.sum() == 0:
+            loss[3] = loss[4] = loss[5] = torch.tensor(0., device=device)
+        else:
+            pos_preds   = pred_extras[fg_bool]         # (num_pos, ne)
+            pos_targets = target_per_pred[fg_bool]     # (num_pos, ne)
+            loss[3] = self.loss_area(pos_preds[:, 0], pos_targets[:, 0])
+            loss[4] = self.loss_height(pos_preds[:, 1], pos_targets[:, 1])
+            loss[5] = self.loss_inclination(pos_preds[:, 2], pos_targets[:, 2])
+
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
+        loss[3] *= 1.0  # area gain
+        loss[4] *= 1.0  # inclination gain
+        loss[5] *= 1.0  # orientation gain
+
+        total_loss = loss[0] + loss[1] + loss[2] + loss[3] + loss[4] + loss[5]
+        return total_loss, (loss[0], loss[1], loss[2], loss[3], loss[4], loss[5])
+```
+
+
+4. Add the RoofModel class to the nn/tasks.py file that should instantiate the desired model
+
+```python
+class RoofModel(DetectionModel):
+    """
+    YOLO Roof model.
+
+    This class extends DetectionModel to handle roof detection tasks, providing specialized
+    loss computation for roof topologys.
+
+    Methods:
+        __init__: Initialize YOLO roof model.
+        init_criterion: Initialize the loss criterion for roof detection.
+
+    Examples:
+        Initialize an roof model
+        >>> model = RoofModel("yolo11n-roof.yaml", ch=3)
+        >>> results = model.predict(image_tensor)
+    """
+
+    def __init__(self, cfg="yolo11n-roof.yaml", ch=3, verbose=True):
+        """
+        Initialize YOLO Roof model with given config and parameters.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels.
+            nc (int, optional): Number of classes.
+            verbose (bool): Whether to display model information.
+        """
+        super().__init__(cfg=cfg, ch=ch, nc=1, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the model."""
+        return v8RoofLoss(self)
+```
+
+Note that here I have been able to load the model, and print it, successefully
+
+  2- Inside the models/yolo folder I add a new folder 
+  that contains four files:
+
+  2.1 - __init__.py 
+
+```python
+from .predict import RoofPredictor
+from .train import RoofTrainer
+from .val import RoofValidator
+
+__all__ = "RoofPredictor", "RoofTrainer", "RoofValidator"
+```
+
+  2.2 - predict.py
+
+```python
+import torch
+
+from ultralytics.engine.results import Results
+from ultralytics.models.yolo.detect.predict import DetectionPredictor
+from ultralytics.utils import DEFAULT_CFG, ops
+
+class RoofPredictor(DetectionPredictor):
+    """
+    A class extending the DetectionPredictor class for prediction based on an Roof model.
+
+    This predictor handles identification of roof detection tasks, processing images and returning results with roof topology
+    characteristics.
+
+    Attributes:
+        args (namespace): Configuration arguments for the predictor.
+        model (torch.nn.Module): The loaded YOLO Roof model.
+
+    Examples:
+        >>> from ultralytics.utils import ASSETS
+        >>> from ultralytics.models.yolo.roof import RoofPredictor
+        >>> args = dict(model="yolo11n-roof.pt", source=ASSETS)
+        >>> predictor = RoofPredictor(overrides=args)
+        >>> predictor.predict_cli()
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        """
+        Initialize RoofPredictor with optional model and data configuration overrides.
+
+        Args:
+            cfg (dict, optional): Default configuration for the predictor.
+            overrides (dict, optional): Configuration overrides that take precedence over the default config.
+            _callbacks (list, optional): List of callback functions to be invoked during prediction.
+
+        Examples:
+            >>> from ultralytics.utils import ASSETS
+            >>> from ultralytics.models.yolo.roof import RoofPredictor
+            >>> args = dict(model="yolo11n-roof.pt", source=ASSETS)
+            >>> predictor = RoofPredictor(overrides=args)
+        """
+        super().__init__(cfg, overrides, _callbacks)
+        self.args.task = "roof"
+
+    def construct_result(self, pred, img, orig_img, img_path):
+        """
+        Construct the result object from the prediction.
+
+        Args:
+            pred (torch.Tensor): The predicted bounding boxes, scores, and rotation angles with shape (N, 9) where
+                the last dimension contains [x, y, w, h, confidence, class_id, var1,var2,var3].
+            img (torch.Tensor): The image after preprocessing with shape (B, C, H, W).
+            orig_img (np.ndarray): The original image before preprocessing.
+            img_path (str): The path to the original image.
+
+        Returns:
+            (Results): The result object containing the original image, image path, class names, and rooftop topology
+                boxes.
+        """
+        rboxes = ops.regularize_roofboxes(torch.cat([pred[:, :4], pred[:, 5:]], dim=-1))
+        rboxes[:, :4] = ops.scale_roofboxes(img.shape[2:], rboxes[:, :4], orig_img.shape, xywh=True)
+        roof = torch.cat([rboxes, pred[:, 4:6]], dim=-1)
+        return Results(orig_img, path=img_path, names=self.model.names, roof=roof)
+
+```
+
+Note that you can only run this once you have already trained a model before
+
+    2.2.1. the predict script requires some utility functions to regularize the boxes, hence we introduce the following utilities in the ops.py file
+
+```py
+def scale_roofboxes(img1_shape, boxes, img0_shape, ratio_pad=None, padding: bool = True, xywh: bool = False):
+    """
+    Rescale bounding boxes from one image shape to another.
+
+    Rescales bounding boxes from img1_shape to img0_shape, accounting for padding and aspect ratio changes.
+    Supports both xyxy and xywh box formats.
+
+    Args:
+        img1_shape (tuple): Shape of the source image (height, width).
+        boxes (torch.Tensor): Bounding boxes to rescale in format (N, 4).
+        img0_shape (tuple): Shape of the target image (height, width).
+        ratio_pad (tuple, optional): Tuple of (ratio, pad) for scaling. If None, calculated from image shapes.
+        padding (bool): Whether boxes are based on YOLO-style augmented images with padding.
+        xywh (bool): Whether box format is xywh (True) or xyxy (False).
+
+    Returns:
+        (torch.Tensor): Rescaled bounding boxes in the same format as input.
+    """
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad_x = round((img1_shape[1] - img0_shape[1] * gain) / 2 - 0.1)
+        pad_y = round((img1_shape[0] - img0_shape[0] * gain) / 2 - 0.1)
+    else:
+        gain = ratio_pad[0][0]
+        pad_x, pad_y = ratio_pad[1]
+
+    if padding:
+        boxes[..., 0] -= pad_x  # x padding
+        boxes[..., 1] -= pad_y  # y padding
+        if not xywh:
+            boxes[..., 2] -= pad_x  # x padding
+            boxes[..., 3] -= pad_y  # y padding
+    boxes[..., :4] /= gain
+    return boxes if xywh else clip_boxes(boxes, img0_shape)
+
+def regularize_roofboxes(rboxes):
+    """
+    Regularize bounding boxes with inclination to range [0, pi/2].
+
+    Args:
+        rboxes (torch.Tensor): Input rotated boxes with shape (N, 9) in xywh area heigh inclination format.
+
+    Returns:
+        (torch.Tensor): Regularized rotated boxes.
+    """
+    x, y, w, h, area,height,inclination = rboxes.unbind(dim=-1)
+    inclination = inclination % (math.pi / 2)
+    return torch.stack([x, y, w, h, area,height,inclination], dim=-1)  # regularized boxes
+
+```
+
+
+  2.3. - train.py
+
+```python
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
+
+from copy import copy
+from pathlib import Path
+from typing import Any
+
+from ultralytics.models import yolo
+from ultralytics.nn.tasks import RoofModel
+from ultralytics.utils import DEFAULT_CFG, RANK
+
+
+class RoofTrainer(yolo.detect.DetectionTrainer):
+    """
+    A class extending the DetectionTrainer class for training based on a Roof model.
+
+    This trainer specializes in training YOLO models that detect roofs in images, while also estimating
+    topology information
+
+    Attributes:
+        loss_names (tuple): Names of the loss components used during training including box_loss, cls_loss,
+            and dfl_loss.
+
+    Methods:
+        get_model: Return RoofModel initialized with specified config and weights.
+        get_validator: Return an instance of RoofValidator for validation of YOLO model.
+
+    Examples:
+        >>> from ultralytics.models.yolo.roof import RoofTrainer
+        >>> args = dict(model="yolo11n-roof.pt", data="dota8.yaml", epochs=3)
+        >>> trainer = RoofTrainer(overrides=args)
+        >>> trainer.train()
+    """
+
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict | None = None, _callbacks: list[Any] | None = None):
+        """
+        Initialize an RoofTrainer object for training Roof models.
+
+        Args:
+            cfg (dict, optional): Configuration dictionary for the trainer. Contains training parameters and
+                model configuration.
+            overrides (dict, optional): Dictionary of parameter overrides for the configuration. Any values here
+                will take precedence over those in cfg.
+            _callbacks (list[Any], optional): List of callback functions to be invoked during training.
+        """
+        if overrides is None:
+            overrides = {}
+        overrides["task"] = "roof"
+        super().__init__(cfg, overrides, _callbacks)
+
+    def get_model(
+        self, cfg: str | dict | None = None, weights: str | Path | None = None, verbose: bool = True
+    ) -> RoofModel:
+        """
+        Return RoofModel initialized with specified config and weights.
+
+        Args:
+            cfg (str | dict, optional): Model configuration. Can be a path to a YAML config file, a dictionary
+                containing configuration parameters, or None to use default configuration.
+            weights (str | Path, optional): Path to pretrained weights file. If None, random initialization is used.
+            verbose (bool): Whether to display model information during initialization.
+
+        Returns:
+            (RoofModel): Initialized RoofModel with the specified configuration and weights.
+
+        Examples:
+            >>> trainer = RoofTrainer()
+            >>> model = trainer.get_model(cfg="yolo11n-roof.yaml", weights="yolo11n-roof.pt")
+        """
+        model = RoofModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        if weights:
+            model.load(weights)
+
+        return model
+
+    def get_validator(self):
+        """Return an instance of RoofValidator for validation of YOLO model."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        return yolo.roof.RoofValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
+```
+
+  2.4 - val.py
+
+```python
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.utils import LOGGER, ops
+from ultralytics.utils.metrics import RoofMetrics, batch_probiou
+from ultralytics.utils.nms import TorchNMS
+
+
+class RoofValidator(DetectionValidator):
+    """
+    A class extending the DetectionValidator class for validation based on a Roof model.
+
+    This validator specializes in evaluating models that predict rotated bounding boxes, commonly used for aerial and
+    satellite imagery where objects can appear at various orientations.
+
+    Attributes:
+        args (dict): Configuration arguments for the validator.
+        metrics (RoofMetrics): Metrics object for evaluating Roof model performance.
+        is_dota (bool): Flag indicating whether the validation dataset is in DOTA format.
+
+    Methods:
+        init_metrics: Initialize evaluation metrics for YOLO.
+        _process_batch: Process batch of detections and ground truth boxes to compute IoU matrix.
+        _prepare_batch: Prepare batch data for Roof validation.
+        _prepare_pred: Prepare predictions with scaled and padded bounding boxes.
+        plot_predictions: Plot predicted bounding boxes on input images.
+        pred_to_json: Serialize YOLO predictions to COCO json format.
+        save_one_txt: Save YOLO detections to a txt file in normalized coordinates.
+        eval_json: Evaluate YOLO output in JSON format and return performance statistics.
+
+    Examples:
+        >>> from ultralytics.models.yolo.roof import RoofValidator
+        >>> args = dict(model="yolo11n-roof.pt", data="dota8.yaml")
+        >>> validator = RoofValidator(args=args)
+        >>> validator(model=args["model"])
+    """
+
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
+        """
+        Initialize RoofValidator and set task to 'roof', metrics to RoofMetrics.
+
+        This constructor initializes an RoofValidator instance for validating Roof models.
+        It extends the DetectionValidator class and configures it specifically for the roof task.
+
+        Args:
+            dataloader (torch.utils.data.DataLoader, optional): Dataloader to be used for validation.
+            save_dir (str | Path, optional): Directory to save results.
+            args (dict | SimpleNamespace, optional): Arguments containing validation parameters.
+            _callbacks (list, optional): List of callback functions to be called during validation.
+        """
+        super().__init__(dataloader, save_dir, args, _callbacks)
+        self.args.task = "roof"
+        self.metrics = RoofMetrics()
+
+    def init_metrics(self, model: torch.nn.Module) -> None:
+        """
+        Initialize evaluation metrics for YOLO roof validation.
+
+        Args:
+            model (torch.nn.Module): Model to validate.
+        """
+        super().init_metrics(model)
+        val = self.data.get(self.args.split, "")  # validation path
+        self.is_dota = isinstance(val, str) and "DOTA" in val  # check if dataset is DOTA format
+        self.confusion_matrix.task = "roof"  # set confusion matrix task to 'obb'
+
+    def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
+        """
+        Compute the correct prediction matrix for a batch of detections and ground truth bounding boxes.
+
+        Args:
+            preds (dict[str, torch.Tensor]): Prediction dictionary containing 'cls' and 'bboxes' keys with detected
+                class labels and bounding boxes.
+            batch (dict[str, torch.Tensor]): Batch dictionary containing 'cls' and 'bboxes' keys with ground truth
+                class labels and bounding boxes.
+
+        Returns:
+            (dict[str, np.ndarray]): Dictionary containing 'tp' key with the correct prediction matrix as a numpy
+                array with shape (N, 10), which includes 10 IoU levels for each detection, indicating the accuracy
+                of predictions compared to the ground truth.
+
+        Examples:
+            >>> detections = torch.rand(100, 7)  # 100 sample detections
+            >>> gt_bboxes = torch.rand(50, 5)  # 50 sample ground truth boxes
+            >>> gt_cls = torch.randint(0, 5, (50,))  # 50 ground truth class labels
+            >>> correct_matrix = validator._process_batch(detections, gt_bboxes, gt_cls)
+        """
+        if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
+            return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
+        iou = batch_probiou(batch["bboxes"], preds["bboxes"])
+        return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
+
+    def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
+        """
+        Args:
+            preds (torch.Tensor): Raw predictions from the model.
+
+        Returns:
+            (list[dict[str, torch.Tensor]]): Processed predictions with angle information concatenated to bboxes.
+        """
+        preds = super().postprocess(preds)
+        for pred in preds:
+            pred["bboxes"] = torch.cat([pred["bboxes"], pred.pop("extra")], dim=-1)  # concatenate angle
+        return preds
+
+    def _prepare_batch(self, si: int, batch: dict[str, Any]) -> dict[str, Any]:
+        """
+        Prepare batch data for OBB validation with proper scaling and formatting.
+
+        Args:
+            si (int): Batch index to process.
+            batch (dict[str, Any]): Dictionary containing batch data with keys:
+                - batch_idx: Tensor of batch indices
+                - cls: Tensor of class labels
+                - bboxes: Tensor of bounding boxes
+                - ori_shape: Original image shapes
+                - img: Batch of images
+                - ratio_pad: Ratio and padding information
+
+        Returns:
+            (dict[str, Any]): Prepared batch data with scaled bounding boxes and metadata.
+        """
+        idx = batch["batch_idx"] == si
+        cls = batch["cls"][idx].squeeze(-1)
+        bbox = batch["bboxes"][idx]
+        ori_shape = batch["ori_shape"][si]
+        imgsz = batch["img"].shape[2:]
+        ratio_pad = batch["ratio_pad"][si]
+        if cls.shape[0]:
+            bbox[..., :4].mul_(torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]])  # target boxes
+        return {
+            "cls": cls,
+            "bboxes": bbox,
+            "ori_shape": ori_shape,
+            "imgsz": imgsz,
+            "ratio_pad": ratio_pad,
+            "im_file": batch["im_file"][si],
+        }
+
+    def plot_predictions(self, batch: dict[str, Any], preds: list[torch.Tensor], ni: int) -> None:
+        """
+        Plot predicted bounding boxes on input images and save the result.
+
+        Args:
+            batch (dict[str, Any]): Batch data containing images, file paths, and other metadata.
+            preds (list[torch.Tensor]): List of prediction tensors for each image in the batch.
+            ni (int): Batch index used for naming the output file.
+
+        Examples:
+            >>> validator = RoofValidator()
+            >>> batch = {"img": images, "im_file": paths}
+            >>> preds = [torch.rand(10, 9)]  # Example predictions for one image
+            >>> validator.plot_predictions(batch, preds, 0)
+        """
+        for p in preds:
+            # TODO: fix this duplicated `xywh2xyxy`
+            p["bboxes"][:, :4] = ops.xywh2xyxy(p["bboxes"][:, :4])  # convert to xyxy format for plotting
+        super().plot_predictions(batch, preds, ni)  # plot bboxes
+
+    def pred_to_json(self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any]) -> None:
+        """
+        Convert YOLO predictions to COCO JSON format with rotated bounding box information.
+
+        Args:
+            predn (dict[str, torch.Tensor]): Prediction dictionary containing 'bboxes', 'conf', and 'cls' keys
+                with bounding box coordinates, confidence scores, and class predictions.
+            pbatch (dict[str, Any]): Batch dictionary containing 'imgsz', 'ori_shape', 'ratio_pad', and 'im_file'.
+
+        Notes:
+            This method processes rotated bounding box predictions and converts them to both rbox format
+            (x, y, w, h, angle) and polygon format (x1, y1, x2, y2, x3, y3, x4, y4) before adding them
+            to the JSON dictionary.
+        """
+        path = Path(pbatch["im_file"])
+        stem = path.stem
+        image_id = int(stem) if stem.isnumeric() else stem
+        rbox = predn["bboxes"]
+        poly = ops.xywhr2xyxyxyxy(rbox).view(-1, 8)
+        for r, b, s, c in zip(rbox.tolist(), poly.tolist(), predn["conf"].tolist(), predn["cls"].tolist()):
+            self.jdict.append(
+                {
+                    "image_id": image_id,
+                    "file_name": path.name,
+                    "category_id": self.class_map[int(c)],
+                    "score": round(s, 5),
+                    "rbox": [round(x, 3) for x in r],
+                    "poly": [round(x, 3) for x in b],
+                }
+            )
+
+    def save_one_txt(self, predn: dict[str, torch.Tensor], save_conf: bool, shape: tuple[int, int], file: Path) -> None:
+        """
+        Save YOLO Roof detections to a text file in normalized coordinates.
+
+        Args:
+            predn (torch.Tensor): Predicted detections with shape (N, 9) containing bounding boxes, confidence scores,
+                class predictions, and extra variables in format (x, y, w, h, conf, cls, var1,var2,var3).
+            save_conf (bool): Whether to save confidence scores in the text file.
+            shape (tuple[int, int]): Original image shape in format (height, width).
+            file (Path): Output file path to save detections.
+
+        Examples:
+            >>> validator = RoofValidator()
+            >>> predn = torch.tensor([[100, 100, 50, 30, 0.9, 0, 45]])  # One detection: x,y,w,h,conf,cls,var1,var2,var3
+            >>> validator.save_one_txt(predn, True, (640, 480), "detection.txt")
+        """
+        import numpy as np
+
+        from ultralytics.engine.results import Results
+
+        Results(
+            np.zeros((shape[0], shape[1]), dtype=np.uint8),
+            path=None,
+            names=self.names,
+            obb=torch.cat([predn["bboxes"], predn["conf"].unsqueeze(-1), predn["cls"].unsqueeze(-1)], dim=1),
+        ).save_txt(file, save_conf=save_conf)
+
+    def scale_preds(self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Scales predictions to the original image size."""
+        return {
+            **predn,
+            "bboxes": ops.scale_boxes(
+                pbatch["imgsz"], predn["bboxes"].clone(), pbatch["ori_shape"], ratio_pad=pbatch["ratio_pad"], xywh=True
+            ),
+        }
+
+    def eval_json(self, stats: dict[str, Any]) -> dict[str, Any]:
+        """
+        Evaluate YOLO output in JSON format and save predictions in DOTA format.
+
+        Args:
+            stats (dict[str, Any]): Performance statistics dictionary.
+
+        Returns:
+            (dict[str, Any]): Updated performance statistics.
+        """
+        if self.args.save_json and self.is_dota and len(self.jdict):
+            import json
+            import re
+            from collections import defaultdict
+
+            pred_json = self.save_dir / "predictions.json"  # predictions
+            pred_txt = self.save_dir / "predictions_txt"  # predictions
+            pred_txt.mkdir(parents=True, exist_ok=True)
+            data = json.load(open(pred_json))
+            # Save split results
+            LOGGER.info(f"Saving predictions with DOTA format to {pred_txt}...")
+            for d in data:
+                image_id = d["image_id"]
+                score = d["score"]
+                classname = self.names[d["category_id"] - 1].replace(" ", "-")
+                p = d["poly"]
+
+                with open(f"{pred_txt / f'Task1_{classname}'}.txt", "a", encoding="utf-8") as f:
+                    f.writelines(f"{image_id} {score} {p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]} {p[6]} {p[7]}\n")
+            # Save merged results, this could result slightly lower map than using official merging script,
+            # because of the probiou calculation.
+            pred_merged_txt = self.save_dir / "predictions_merged_txt"  # predictions
+            pred_merged_txt.mkdir(parents=True, exist_ok=True)
+            merged_results = defaultdict(list)
+            LOGGER.info(f"Saving merged predictions with DOTA format to {pred_merged_txt}...")
+            for d in data:
+                image_id = d["image_id"].split("__", 1)[0]
+                pattern = re.compile(r"\d+___\d+")
+                x, y = (int(c) for c in re.findall(pattern, d["image_id"])[0].split("___"))
+                bbox, score, cls = d["rbox"], d["score"], d["category_id"] - 1
+                bbox[0] += x
+                bbox[1] += y
+                bbox.extend([score, cls])
+                merged_results[image_id].append(bbox)
+            for image_id, bbox in merged_results.items():
+                bbox = torch.tensor(bbox)
+                max_wh = torch.max(bbox[:, :2]).item() * 2
+                c = bbox[:, 6:7] * max_wh  # classes
+                scores = bbox[:, 5]  # scores
+                b = bbox[:, :5].clone()
+                b[:, :2] += c
+                # 0.3 could get results close to the ones from official merging script, even slightly better.
+                i = TorchNMS.fast_nms(b, scores, 0.3, iou_func=batch_probiou)
+                bbox = bbox[i]
+
+                b = ops.xywhr2xyxyxyxy(bbox[:, :5]).view(-1, 8)
+                for x in torch.cat([b, bbox[:, 5:7]], dim=-1).tolist():
+                    classname = self.names[int(x[-1])].replace(" ", "-")
+                    p = [round(i, 3) for i in x[:-2]]  # poly
+                    score = round(x[-2], 3)
+
+                    with open(f"{pred_merged_txt / f'Task1_{classname}'}.txt", "a", encoding="utf-8") as f:
+                        f.writelines(f"{image_id} {score} {p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]} {p[6]} {p[7]}\n")
+
+        return stats
+```
+
+Now note that this still has data from the BBox structure, so more things need to be changed inside these structures
+
+
+3. Add the roof metric to the file utils/metrics.py
+
+```python
+class RoofMetrics(DetMetrics):
+    """
+    Metrics for evaluating Roof detection.
+
+    Attributes:
+        names (dict[int, str]): Dictionary of class names.
+        box (Metric): An instance of the Metric class for storing detection results.
+        speed (dict[str, float]): A dictionary for storing execution times of different parts of the detection process.
+        task (str): The task type, set to 'roof'.
+        stats (dict[str, list]): A dictionary containing lists for true positives, confidence scores, predicted classes, target classes, and target images.
+        nt_per_class: Number of targets per class.
+        nt_per_image: Number of targets per image.
+
+    References:
+        https://arxiv.org/pdf/2106.06072.pdf
+    """
+
+    def __init__(self, names: dict[int, str] = {}) -> None:
+        """
+        Initialize an RoofMetrics instance with directory, plotting, and class names.
+
+        Args:
+            names (dict[int, str], optional): Dictionary of class names.
+        """
+        DetMetrics.__init__(self, names)
+        # TODO: probably remove task as well
+        self.task = "roof"
+```
+
+6. I need to change the formating class that loads the data from batch
+
+```py
+
+class Format:
+    """
+    A class for formatting image annotations for object detection, instance segmentation, and pose estimation tasks.
+
+    This class standardizes image and instance annotations to be used by the `collate_fn` in PyTorch DataLoader.
+
+    Attributes:
+        bbox_format (str): Format for bounding boxes. Options are 'xywh' or 'xyxy'.
+        normalize (bool): Whether to normalize bounding boxes.
+        return_mask (bool): Whether to return instance masks for segmentation.
+        return_keypoint (bool): Whether to return keypoints for pose estimation.
+        return_obb (bool): Whether to return oriented bounding boxes.
+        mask_ratio (int): Downsample ratio for masks.
+        mask_overlap (bool): Whether to overlap masks.
+        batch_idx (bool): Whether to keep batch indexes.
+        bgr (float): The probability to return BGR images.
+
+    Methods:
+        __call__: Format labels dictionary with image, classes, bounding boxes, and optionally masks and keypoints.
+        _format_img: Convert image from Numpy array to PyTorch tensor.
+        _format_segments: Convert polygon points to bitmap masks.
+
+    Examples:
+        >>> formatter = Format(bbox_format="xywh", normalize=True, return_mask=True)
+        >>> formatted_labels = formatter(labels)
+        >>> img = formatted_labels["img"]
+        >>> bboxes = formatted_labels["bboxes"]
+        >>> masks = formatted_labels["masks"]
+    """
+
+    def __init__(
+        self,
+        bbox_format: str = "xywh",
+        normalize: bool = True,
+        return_mask: bool = False,
+        return_keypoint: bool = False,
+        return_obb: bool = False,
+        return_roof: bool = False,
+        mask_ratio: int = 4,
+        mask_overlap: bool = True,
+        batch_idx: bool = True,
+        bgr: float = 0.0,
+    ):
+        """
+        Initialize the Format class with given parameters for image and instance annotation formatting.
+
+        This class standardizes image and instance annotations for object detection, instance segmentation, and pose
+        estimation tasks, preparing them for use in PyTorch DataLoader's `collate_fn`.
+
+        Args:
+            bbox_format (str): Format for bounding boxes. Options are 'xywh', 'xyxy', etc.
+            normalize (bool): Whether to normalize bounding boxes to [0,1].
+            return_mask (bool): If True, returns instance masks for segmentation tasks.
+            return_keypoint (bool): If True, returns keypoints for pose estimation tasks.
+            return_obb (bool): If True, returns oriented bounding boxes.
+            mask_ratio (int): Downsample ratio for masks.
+            mask_overlap (bool): If True, allows mask overlap.
+            batch_idx (bool): If True, keeps batch indexes.
+            bgr (float): Probability of returning BGR images instead of RGB.
+
+        Attributes:
+            bbox_format (str): Format for bounding boxes.
+            normalize (bool): Whether bounding boxes are normalized.
+            return_mask (bool): Whether to return instance masks.
+            return_keypoint (bool): Whether to return keypoints.
+            return_obb (bool): Whether to return oriented bounding boxes.
+            mask_ratio (int): Downsample ratio for masks.
+            mask_overlap (bool): Whether masks can overlap.
+            batch_idx (bool): Whether to keep batch indexes.
+            bgr (float): The probability to return BGR images.
+
+        Examples:
+            >>> format = Format(bbox_format="xyxy", return_mask=True, return_keypoint=False)
+            >>> print(format.bbox_format)
+            xyxy
+        """
+        self.bbox_format = bbox_format
+        self.normalize = normalize
+        self.return_mask = return_mask  # set False when training detection only
+        self.return_keypoint = return_keypoint
+        self.return_obb = return_obb
+        self.return_roof = return_roof
+        self.mask_ratio = mask_ratio
+        self.mask_overlap = mask_overlap
+        self.batch_idx = batch_idx  # keep the batch indexes
+        self.bgr = bgr
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Format image annotations for object detection, instance segmentation, and pose estimation tasks.
+
+        This method standardizes the image and instance annotations to be used by the `collate_fn` in PyTorch
+        DataLoader. It processes the input labels dictionary, converting annotations to the specified format and
+        applying normalization if required.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image and annotation data with the following keys:
+                - 'img': The input image as a numpy array.
+                - 'cls': Class labels for instances.
+                - 'instances': An Instances object containing bounding boxes, segments, and keypoints.
+
+        Returns:
+            (dict[str, Any]): A dictionary with formatted data, including:
+                - 'img': Formatted image tensor.
+                - 'cls': Class label's tensor.
+                - 'bboxes': Bounding boxes tensor in the specified format.
+                - 'masks': Instance masks tensor (if return_mask is True).
+                - 'keypoints': Keypoints tensor (if return_keypoint is True).
+                - 'batch_idx': Batch index tensor (if batch_idx is True).
+
+        Examples:
+            >>> formatter = Format(bbox_format="xywh", normalize=True, return_mask=True)
+            >>> labels = {"img": np.random.rand(640, 640, 3), "cls": np.array([0, 1]), "instances": Instances(...)}
+            >>> formatted_labels = formatter(labels)
+            >>> print(formatted_labels.keys())
+        """
+        img = labels.pop("img")
+        h, w = img.shape[:2]
+        cls = labels.pop("cls")
+        instances = labels.pop("instances")
+        instances.convert_bbox(format=self.bbox_format)
+        instances.denormalize(w, h)
+        nl = len(instances)
+
+        if self.return_mask:
+            if nl:
+                masks, instances, cls = self._format_segments(instances, cls, w, h)
+                masks = torch.from_numpy(masks)
+            else:
+                masks = torch.zeros(
+                    1 if self.mask_overlap else nl, img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio
+                )
+            labels["masks"] = masks
+        labels["img"] = self._format_img(img)
+        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
+        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        if self.return_keypoint:
+            labels["keypoints"] = (
+                torch.empty(0, 3) if instances.keypoints is None else torch.from_numpy(instances.keypoints)
+            )
+            if self.normalize:
+                labels["keypoints"][..., 0] /= w
+                labels["keypoints"][..., 1] /= h
+        if self.return_obb:
+            labels["bboxes"] = (
+                xyxyxyxy2xywhr(torch.from_numpy(instances.segments)) if len(instances.segments) else torch.zeros((0, 5))
+            )
+        # NOTE: need to normalize obb in xywhr format for width-height consistency
+        if self.normalize:
+            labels["bboxes"][:, [0, 2]] /= w
+            labels["bboxes"][:, [1, 3]] /= h
+        # Then we can use collate_fn
+        if self.batch_idx:
+            labels["batch_idx"] = torch.zeros(nl)
+        if self.return_roof:
+            labels["extras"] = torch.zeros(nl)
+        return labels
+
+    def _format_img(self, img: np.ndarray) -> torch.Tensor:
+        """
+        Format an image for YOLO from a Numpy array to a PyTorch tensor.
+
+        This function performs the following operations:
+        1. Ensures the image has 3 dimensions (adds a channel dimension if needed).
+        2. Transposes the image from HWC to CHW format.
+        3. Optionally flips the color channels from RGB to BGR.
+        4. Converts the image to a contiguous array.
+        5. Converts the Numpy array to a PyTorch tensor.
+
+        Args:
+            img (np.ndarray): Input image as a Numpy array with shape (H, W, C) or (H, W).
+
+        Returns:
+            (torch.Tensor): Formatted image as a PyTorch tensor with shape (C, H, W).
+
+        Examples:
+            >>> import numpy as np
+            >>> img = np.random.rand(100, 100, 3)
+            >>> formatted_img = self._format_img(img)
+            >>> print(formatted_img.shape)
+            torch.Size([3, 100, 100])
+        """
+        if len(img.shape) < 3:
+            img = np.expand_dims(img, -1)
+        img = img.transpose(2, 0, 1)
+        img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) > self.bgr and img.shape[0] == 3 else img)
+        img = torch.from_numpy(img)
+        return img
+
+    def _format_segments(
+        self, instances: Instances, cls: np.ndarray, w: int, h: int
+    ) -> tuple[np.ndarray, Instances, np.ndarray]:
+        """
+        Convert polygon segments to bitmap masks.
+
+        Args:
+            instances (Instances): Object containing segment information.
+            cls (np.ndarray): Class labels for each instance.
+            w (int): Width of the image.
+            h (int): Height of the image.
+
+        Returns:
+            masks (np.ndarray): Bitmap masks with shape (N, H, W) or (1, H, W) if mask_overlap is True.
+            instances (Instances): Updated instances object with sorted segments if mask_overlap is True.
+            cls (np.ndarray): Updated class labels, sorted if mask_overlap is True.
+
+        Notes:
+            - If self.mask_overlap is True, masks are overlapped and sorted by area.
+            - If self.mask_overlap is False, each mask is represented separately.
+            - Masks are downsampled according to self.mask_ratio.
+        """
+        segments = instances.segments
+        if self.mask_overlap:
+            masks, sorted_idx = polygons2masks_overlap((h, w), segments, downsample_ratio=self.mask_ratio)
+            masks = masks[None]  # (640, 640) -> (1, 640, 640)
+            instances = instances[sorted_idx]
+            cls = cls[sorted_idx]
+        else:
+            masks = polygons2masks((h, w), segments, color=1, downsample_ratio=self.mask_ratio)
+
+        return masks, instances, cls
+```
+
+```py
+def verify_image_label(args: tuple) -> list:
+    """Verify one image-label pair."""
+    im_file, lb_file, prefix, keypoint,rooftop, num_cls, nkpt, ndim, single_cls = args
+    # Number (missing, found, empty, corrupt), message, segments, keypoints
+    nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
+    try:
+        # Verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        shape = (shape[1], shape[0])  # hw
+        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}. {FORMATS_HELP_MSG}"
+        if im.format.lower() in {"jpg", "jpeg"}:
+            with open(im_file, "rb") as f:
+                f.seek(-2, 2)
+                if f.read() != b"\xff\xd9":  # corrupt JPEG
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+                    msg = f"{prefix}{im_file}: corrupt JPEG restored and saved"
+
+        # Verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            with open(lb_file, encoding="utf-8") as f:
+                lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                if any(len(x) > 6 for x in lb) and (not keypoint) and (not rooftop):  # is segment
+                    classes = np.array([x[0] for x in lb], dtype=np.float32)
+                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
+                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                lb = np.array(lb, dtype=np.float32)
+            if nl := len(lb):
+                if keypoint:
+                    assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
+                    points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                if rooftop:
+                    assert lb.shape[1] == (5 + 3), f"labels require {(5 +3)} columns each"
+                    extras = lb[:, 5:]
+                    lb = lb[:, 0:5]  # Keep only class + bbox for standard processing
+                    points = lb[:, 1:]  # Define points as bbox coordinates for validation        
+                else:
+                    assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
+                    points = lb[:, 1:]
+                # Coordinate points check with 1% tolerance
+                assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
+                assert lb.min() >= -0.01, f"negative class labels or coordinate {lb[lb < -0.01]}"
+
+                # All labels
+                max_cls = 0 if single_cls else lb[:, 0].max()  # max label count
+                assert max_cls < num_cls, (
+                    f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
+                    f"Possible class labels are 0-{num_cls - 1}"
+                )
+                _, i = np.unique(lb, axis=0, return_index=True)
+                if len(i) < nl:  # duplicate row check
+                    lb = lb[i]  # remove duplicates
+                    if segments:
+                        segments = [segments[x] for x in i]
+                    msg = f"{prefix}{im_file}: {nl - len(i)} duplicate labels removed"
+            else:
+                ne = 1  # label empty
+                lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+        if keypoint:
+            keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
+            if ndim == 2:
+                kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
+                keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
+        lb = lb[:, :5]
+        return im_file, lb, shape, segments, keypoints,extras, nm, nf, ne, nc, msg
+    except Exception as e:
+        nc = 1
+        msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
+        return [None, None, None, None, None,None, nm, nf, ne, nc, msg]
+```
+
+```py
+class YOLODataset(BaseDataset):
+    """
+    Dataset class for loading object detection and/or segmentation labels in YOLO format.
+
+    This class supports loading data for object detection, segmentation, pose estimation, and oriented bounding box
+    (OBB) tasks using the YOLO format.
+
+    Attributes:
+        use_segments (bool): Indicates if segmentation masks should be used.
+        use_keypoints (bool): Indicates if keypoints should be used for pose estimation.
+        use_obb (bool): Indicates if oriented bounding boxes should be used.
+        data (dict): Dataset configuration dictionary.
+
+    Methods:
+        cache_labels: Cache dataset labels, check images and read shapes.
+        get_labels: Return dictionary of labels for YOLO training.
+        build_transforms: Build and append transforms to the list.
+        close_mosaic: Set mosaic, copy_paste and mixup options to 0.0 and build transformations.
+        update_labels_info: Update label format for different tasks.
+        collate_fn: Collate data samples into batches.
+
+    Examples:
+        >>> dataset = YOLODataset(img_path="path/to/images", data={"names": {0: "person"}}, task="detect")
+        >>> dataset.get_labels()
+    """
+
+    def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
+        """
+        Initialize the YOLODataset.
+
+        Args:
+            data (dict, optional): Dataset configuration dictionary.
+            task (str): Task type, one of 'detect', 'segment', 'pose', 'obb' or 'roof'.
+            *args (Any): Additional positional arguments for the parent class.
+            **kwargs (Any): Additional keyword arguments for the parent class.
+        """
+        self.use_segments = task == "segment"
+        self.use_keypoints = task == "pose"
+        self.use_obb = task == "obb"
+        self.use_roof = task == "roof"
+        self.data = data
+        assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
+
+    def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
+        """
+        Cache dataset labels, check images and read shapes.
+
+        Args:
+            path (Path): Path where to save the cache file.
+
+        Returns:
+            (dict): Dictionary containing cached labels and related information.
+        """
+        x = {"labels": []}
+        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
+        desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
+        total = len(self.im_files)
+        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
+        if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
+            raise ValueError(
+                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
+                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
+            )
+        with ThreadPool(NUM_THREADS) as pool:
+            results = pool.imap(
+                func=verify_image_label,
+                iterable=zip(
+                    self.im_files,
+                    self.label_files,
+                    repeat(self.prefix),
+                    repeat(self.use_keypoints),
+                    repeat(self.use_roof),
+                    repeat(len(self.data["names"])),
+                    repeat(nkpt),
+                    repeat(ndim),
+                    repeat(self.single_cls),
+                ),
+            )
+            pbar = TQDM(results, desc=desc, total=total)
+            for im_file, lb, shape, segments, keypoint,extras, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                nm += nm_f
+                nf += nf_f
+                ne += ne_f
+                nc += nc_f
+                if im_file:
+                    x["labels"].append(
+                        {
+                            "im_file": im_file,
+                            "shape": shape,
+                            "cls": lb[:, 0:1],  # n, 1
+                            "bboxes": lb[:, 1:],  # n, 4
+                            "segments": segments,
+                            "keypoints": keypoint,
+                            "extras": extras,
+                            "normalized": True,
+                            "bbox_format": "xywh",
+                        }
+                    )
+                if msg:
+                    msgs.append(msg)
+                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            pbar.close()
+
+        if msgs:
+            LOGGER.info("\n".join(msgs))
+        if nf == 0:
+            LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
+        x["hash"] = get_hash(self.label_files + self.im_files)
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["msgs"] = msgs  # warnings
+        save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
+        return x
+
+    def get_labels(self) -> list[dict]:
+        """
+        Return dictionary of labels for YOLO training.
+
+        This method loads labels from disk or cache, verifies their integrity, and prepares them for training.
+
+        Returns:
+            (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
+        """
+        self.label_files = img2label_paths(self.im_files)
+        cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        try:
+            cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
+            assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
+            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+            cache, exists = self.cache_labels(cache_path), False  # run cache ops
+
+        # Display cache
+        nf, nm, ne, nc, n = cache.pop("results")  # found, missing, empty, corrupt, total
+        if exists and LOCAL_RANK in {-1, 0}:
+            d = f"Scanning {cache_path}... {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+            TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
+            if cache["msgs"]:
+                LOGGER.info("\n".join(cache["msgs"]))  # display warnings
+
+        # Read cache
+        [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
+        labels = cache["labels"]
+        if not labels:
+            raise RuntimeError(
+                f"No valid images found in {cache_path}. Images with incorrectly formatted labels are ignored. {HELP_URL}"
+            )
+        self.im_files = [lb["im_file"] for lb in labels]  # update im_files
+
+        # Check if the dataset is all boxes or all segments
+        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
+        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
+        if len_segments and len_boxes != len_segments:
+            LOGGER.warning(
+                f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
+                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
+                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
+            )
+            for lb in labels:
+                lb["segments"] = []
+        if len_cls == 0:
+            LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+        return labels
+
+    def build_transforms(self, hyp: dict | None = None) -> Compose:
+        """
+        Build and append transforms to the list.
+
+        Args:
+            hyp (dict, optional): Hyperparameters for transforms.
+
+        Returns:
+            (Compose): Composed transforms.
+        """
+        if self.augment:
+            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                return_roof=self.use_roof,
+                batch_idx=True,
+                mask_ratio=hyp.mask_ratio,
+                mask_overlap=hyp.overlap_mask,
+                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+            )
+        )
+        return transforms
+
+    def close_mosaic(self, hyp: dict) -> None:
+        """
+        Disable mosaic, copy_paste, mixup and cutmix augmentations by setting their probabilities to 0.0.
+
+        Args:
+            hyp (dict): Hyperparameters for transforms.
+        """
+        hyp.mosaic = 0.0
+        hyp.copy_paste = 0.0
+        hyp.mixup = 0.0
+        hyp.cutmix = 0.0
+        self.transforms = self.build_transforms(hyp)
+
+    def update_labels_info(self, label: dict) -> dict:
+        """
+        Update label format for different tasks.
+
+        Args:
+            label (dict): Label dictionary containing bboxes, segments, keypoints, etc.
+
+        Returns:
+            (dict): Updated label dictionary with instances.
+
+        Note:
+            cls is not with bboxes now, classification and semantic segmentation need an independent cls label
+            Can also support classification and semantic segmentation by adding or removing dict keys there.
+        """
+        bboxes = label.pop("bboxes")
+        segments = label.pop("segments", [])
+        keypoints = label.pop("keypoints", None)
+        bbox_format = label.pop("bbox_format")
+        normalized = label.pop("normalized")
+        extras = label.pop("extras")
+
+        # NOTE: do NOT resample oriented boxes
+        segment_resamples = 100 if self.use_obb or self.use_roof else 1000
+        if len(segments) > 0:
+            # make sure segments interpolate correctly if original length is greater than segment_resamples
+            max_len = max(len(s) for s in segments)
+            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
+            # list[np.array(segment_resamples, 2)] * num_samples
+            segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
+        else:
+            segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+        label["instances"] = Instances(bboxes, segments, keypoints,extras, bbox_format=bbox_format, normalized=normalized)
+        return label
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """
+        Collate data samples into batches.
+
+        Args:
+            batch (list[dict]): List of dictionaries containing sample data.
+
+        Returns:
+            (dict): Collated batch with stacked tensors.
+        """
+        new_batch = {}
+        batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        for i, k in enumerate(keys):
+            value = values[i]
+            if k in {"img", "text_feats"}:
+                value = torch.stack(value, 0)
+            elif k == "visuals":
+                value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb","extras"}:
+                value = torch.cat(value, 0)
+            new_batch[k] = value
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
+```
+
+7. Test the previous additions through 
+
+```py
+# smoke_test_model.py
+import torch
+from pathlib import Path
+from ultralytics.nn.tasks import RoofModel
+from ultralytics.nn.tasks import OBBModel
+from ultralytics.utils import (
+    DEFAULT_CFG,
+    GIT,
+    LOCAL_RANK,
+    LOGGER,
+    RANK,
+    TQDM,
+    YAML,
+    callbacks,
+    clean_url,
+    colorstr,
+    emojis,
+)
+
+def print_info(m):
+    head = m.model[-1]
+    print("Head attributes:")
+    for k in ("nc", "ne", "no", "reg_max", "nl", "stride"):
+        print(f"  {k}: {getattr(head, k, None)}")
+    print("Model summary done.")
+
+def smoke(cfg="yolo11n-roof.yaml", imgsz=640, device="cpu"):
+    m = RoofModel(cfg=cfg, ch=3, verbose=False)
+
+    m.to(device)
+    m.eval()
+    print("Model loaded.")
+    print_info(m)
+
+    img = torch.randn(1, 3, imgsz, imgsz, device=device)
+    # Try forward in eval (should set extras)
+    out = m(img)
+    print("Forward (eval) returned type:", type(out))
+    # If extras stored on head, print shape
+    head = m.model[-1]
+    if hasattr(head, "extras"):
+        print("extras shape:", head.extras.shape)
+    else:
+        print("No `extras` attribute on head after eval forward.")
+
+    # Try training forward (for training route)
+    m.train()
+    try:
+        out_train = m(img)
+        print("Forward (train) OK. returned type:", type(out_train))
+    except Exception as e:
+        print("Train forward failed:", e)
+
+def test_loss(cfg="yolo11n-roof.yaml", imgsz=640, device="cpu"):
+    from ultralytics.utils.loss import v8RoofLoss
+    from ultralytics.nn.tasks import RoofModel
+
+    m = RoofModel(cfg=cfg, ch=3, verbose=False)
+    m.args = DEFAULT_CFG  # or a custom dict with required hyperparameters
+    m.to(device)
+    m.train()
+    criterion = v8RoofLoss(m)
+
+    # Mock batch: should include "extras" key for target_extras
+    tmpbatch = {
+        "img": torch.randn(1, 3, imgsz, imgsz, device=device),
+        "cls": torch.randint(0, 1, (1, 100, 1), device=device),
+        "bboxes": torch.randn(1, 100, 4, device=device),
+        "extras": torch.randn(1, 100, 3, device=device),  # area, height, inclination
+    }
+
+    bs = tmpbatch["img"].shape[0]      # 1 in your mock
+    nt = tmpbatch["bboxes"].shape[1]   # 100 in your mock
+    # For general batch size:
+    batch_idx = torch.arange(bs, device=tmpbatch["img"].device).unsqueeze(1).repeat(1, nt).view(-1)
+
+    batch = {
+        "img": torch.randn(1, 3, imgsz, imgsz, device=device),
+        "cls": torch.randint(0, 1, (1, 100, 1), device=device),
+        "bboxes": torch.randn(1, 100, 4, device=device),
+        "extras": torch.randn(1, 100, 3, device=device),  # area, height, inclination
+    }
+
+    # For your (bs=1) case this will be all zeros of length 100
+    batch["batch_idx"] = batch_idx
+    # Also flatten cls and bboxes to match Ultralytics expectation:
+    batch["cls"] = tmpbatch["cls"].view(-1)          # (M,)
+    batch["bboxes"] = tmpbatch["bboxes"].view(-1, 4) # (M,4)
+
+    feats, extras = m(batch["img"])         # returns same structure as training forward()
+    preds = (feats, extras)
+    total_loss, loss_details = criterion(preds, batch)
+
+    # Mock predictions: (detect_out, extras)
+    #preds = (
+    #    torch.randn(1, 100, 8, device=device),  # detect_out: xywh, conf, cls, area, height, inclination
+    #    torch.randn(1, 3, 100, device=device),  # extras: area, height, inclination
+    #)
+
+    try:
+        total_loss, loss_details = criterion(preds, batch)
+        print("Loss computation successful!")
+        print(f"Total loss: {total_loss.item()}")
+        print(f"Loss details: {loss_details}")
+    except Exception as e:
+        print(f"Loss computation failed: {e}")
+
+if __name__ == "__main__":
+    smoke()
+    test_loss()
+```
+
+

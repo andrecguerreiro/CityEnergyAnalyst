@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,11 +21,15 @@ from cea.config import Configuration, parse_string_coordinate_list
 from cea.inputlocator import InputLocator
 
 DEFAULT_BUILDING_FALLBACK = "B1000"
+DEFAULT_UCEA_SCENARIO = r"C:\Users\Andre\cea-scenarios\test-tilt"
 DEFAULT_GEOJSON_URL = "https://geojson.io/#map=18.2/38.708267/-9.138085"
+DEFAULT_INE_HEIGHT_GPKG = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "INE_com_NPAV_norm0.gpkg")
+)
 ROOF_RELATIVE_PATH = os.path.join("inputs", "building-geometry", "roof_surfaces.geojson")
-DEFAULT_ROOF_SURFACES_GEOJSON = {
+DEFAULT_ROOF_SURFACES_GEOJSON ={
   "type": "FeatureCollection",
-  "name": "tilted_roof",
+  "name": "roof",
   "crs": {
     "type": "name",
     "properties": {
@@ -35,7 +40,7 @@ DEFAULT_ROOF_SURFACES_GEOJSON = {
     {
       "type": "Feature",
       "properties": {
-        "building": "B1000",
+        "building": "B1003",
         "roof_id": "1"
       },
       "geometry": {
@@ -43,29 +48,462 @@ DEFAULT_ROOF_SURFACES_GEOJSON = {
         "coordinates": [
           [
             [
-              469440.6180762463,
-              4282452.974460124,
-              23.5
+              469412.6395426503,
+              4282433.9341752175,
+              9.472797393798828
             ],
             [
-              469450.15954341384,
-              4282451.218962209,
-              23.5
+              469412.6864647212,
+              4282433.92681034,
+              9.477940559387207
             ],
             [
-              469448.3828239006,
-              4282441.56077624,
-              16.722939852573275
+              469414.31193959294,
+              4282439.572283552,
+              11.047562599182129
             ],
             [
-              469438.83958826656,
-              4282443.328358676,
-              16.730921007557723
+              469414.3269647871,
+              4282439.634895555,
+              11.065096855163574
             ],
             [
-              469440.6180762463,
-              4282452.974460124,
-              23.5
+              469409.8246406832,
+              4282440.935408365,
+              10.527775764465332
+            ],
+            [
+              469409.77771861246,
+              4282440.942773244,
+              10.522059440612793
+            ],
+            [
+              469408.16019952344,
+              4282435.281757862,
+              8.94910717010498
+            ],
+            [
+              469408.1372185749,
+              4282435.234688073,
+              8.934903144836426
+            ],
+            [
+              469412.6395426503,
+              4282433.9341752175,
+              9.472797393798828
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1010",
+        "roof_id": "1"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469413.59441232204,
+              4282427.922673877,
+              10.0
+            ],
+            [
+              469413.59581565025,
+              4282427.774321208,
+              10.0
+            ],
+            [
+              469413.7982432566,
+              4282412.978685272,
+              10.0
+            ],
+            [
+              469413.8528995033,
+              4282412.979202285,
+              10.0
+            ],
+            [
+              469419.185566033,
+              4282413.053072203,
+              10.0
+            ],
+            [
+              469419.17628081434,
+              4282413.209159049,
+              10.0
+            ],
+            [
+              469418.97392706113,
+              4282427.996987098,
+              10.0
+            ],
+            [
+              469418.9192708139,
+              4282427.996470083,
+              10.0
+            ],
+            [
+              469413.59441232204,
+              4282427.922673877,
+              10.0
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1011",
+        "roof_id": "1"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469418.59153352276,
+              4282423.019206328,
+              11.966423988342285
+            ],
+            [
+              469418.77892637067,
+              4282423.020978953,
+              11.919546127319336
+            ],
+            [
+              469434.4574615404,
+              4282423.169288452,
+              8.033576011657715
+            ],
+            [
+              469434.45687066595,
+              4282423.231752736,
+              8.02748966217041
+            ],
+            [
+              469434.3834544516,
+              4282430.99294008,
+              7.275455951690674
+            ],
+            [
+              469434.2741419539,
+              4282430.991906048,
+              7.304182052612305
+            ],
+            [
+              469418.51752643526,
+              4282430.842857726,
+              11.208303451538086
+            ],
+            [
+              469418.5183388889,
+              4282430.756969338,
+              11.21680736541748
+            ],
+            [
+              469418.59153352276,
+              4282423.019206328,
+              11.966423988342285
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1011",
+        "roof_id": "2"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469418.5921243973,
+              4282422.956742046,
+              8.0968017578125
+            ],
+            [
+              469418.59153352276,
+              4282423.019206328,
+              8.103830337524414
+            ],
+            [
+              469434.2700686871,
+              4282423.167515829,
+              11.851225852966309
+            ],
+            [
+              469434.4574615404,
+              4282423.169288452,
+              11.896169662475586
+            ],
+            [
+              469434.53065606416,
+              4282415.431525215,
+              11.037753105163574
+            ],
+            [
+              469434.5314685154,
+              4282415.345636823,
+              11.02817153930664
+            ],
+            [
+              469418.7748529911,
+              4282415.19658896,
+              7.263378143310547
+            ],
+            [
+              469418.66554049647,
+              4282415.19555493,
+              7.235833168029785
+            ],
+            [
+              469418.5921243973,
+              4282422.956742046,
+              8.0968017578125
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1012",
+        "roof_id": "1"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469449.58283975715,
+              4282419.056605149,
+              11.387120246887207
+            ],
+            [
+              469449.76242458,
+              4282419.058303912,
+              11.355616569519043
+            ],
+            [
+              469465.07265349315,
+              4282419.343686555,
+              8.612879753112793
+            ],
+            [
+              469465.07184104127,
+              4282419.4295749515,
+              8.623546600341797
+            ],
+            [
+              469464.889882716,
+              4282428.75929166,
+              9.849780082702637
+            ],
+            [
+              469464.74153003196,
+              4282428.757888331,
+              9.877182006835938
+            ],
+            [
+              469449.40795088187,
+              4282428.464475806,
+              12.62402057647705
+            ],
+            [
+              469449.40905877267,
+              4282428.347355269,
+              12.60842514038086
+            ],
+            [
+              469449.58283975715,
+              4282419.056605149,
+              11.387120246887207
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1012",
+        "roof_id": "2"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469449.7656103629,
+              4282409.641000311,
+              9.784828186035156
+            ],
+            [
+              469449.9139630427,
+              4282409.642403635,
+              9.810946464538574
+            ],
+            [
+              469465.2475422104,
+              4282409.935815625,
+              12.446929931640625
+            ],
+            [
+              469465.24650818267,
+              4282410.045128128,
+              12.433055877685547
+            ],
+            [
+              469465.07265349315,
+              4282419.343686555,
+              11.331050872802734
+            ],
+            [
+              469464.9008767011,
+              4282419.342061652,
+              11.300966262817383
+            ],
+            [
+              469449.58283975715,
+              4282419.056605149,
+              8.668949127197266
+            ],
+            [
+              469449.5836522089,
+              4282418.970716755,
+              8.678633689880371
+            ],
+            [
+              469449.7656103629,
+              4282409.641000311,
+              9.784828186035156
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1013",
+        "roof_id": "1"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469433.82941004855,
+              4282415.268717177,
+              8.523118019104004
+            ],
+            [
+              469433.96995468845,
+              4282415.270046641,
+              8.516289710998535
+            ],
+            [
+              469450.1875402054,
+              4282415.392220055,
+              7.721311092376709
+            ],
+            [
+              469450.1869493318,
+              4282415.454684342,
+              7.735836982727051
+            ],
+            [
+              469450.1215417923,
+              4282424.020247316,
+              9.599096298217773
+            ],
+            [
+              469449.96538107673,
+              4282424.01877013,
+              9.606799125671387
+            ],
+            [
+              469433.7710719529,
+              4282423.912434105,
+              10.400903701782227
+            ],
+            [
+              469433.7719582647,
+              4282423.818737677,
+              10.381409645080566
+            ],
+            [
+              469433.82941004855,
+              4282415.268717177,
+              8.523118019104004
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "building": "B1013",
+        "roof_id": "2"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              469433.7710719529,
+              4282423.912434105,
+              9.568986892700195
+            ],
+            [
+              469433.92723266373,
+              4282423.9139112905,
+              9.577242851257324
+            ],
+            [
+              469450.1215417923,
+              4282424.020247316,
+              10.431013107299805
+            ],
+            [
+              469450.1206554805,
+              4282424.113943745,
+              10.411149978637695
+            ],
+            [
+              469450.06320355786,
+              4282432.663964506,
+              8.523112297058105
+            ],
+            [
+              469449.9226589137,
+              4282432.662635038,
+              8.51577091217041
+            ],
+            [
+              469433.70499954215,
+              4282432.548269139,
+              7.66108512878418
+            ],
+            [
+              469433.7055904179,
+              4282432.485804853,
+              7.675730228424072
+            ],
+            [
+              469433.7710719529,
+              4282423.912434105,
+              9.568986892700195
             ]
           ]
         ]
@@ -86,6 +524,8 @@ class UceaRuntime:
     comparison_root: str
     building: str
     output_figure: str
+    viewer_started: bool
+    comparison_ran: bool
 
 
 def _log(message: str) -> None:
@@ -312,6 +752,7 @@ def _prepare_site_polygon(config: Configuration, coordinates: list[tuple[float, 
 
 
 def _run_data_preparation(config: Configuration) -> None:
+    _configure_height_enrichment_paths(config)
     _call_api("database_helper", config, databases_path=config.ucea.database_path)
     _call_api("zone_helper", config)
     if config.ucea.run_surroundings_helper:
@@ -324,6 +765,20 @@ def _run_data_preparation(config: Configuration) -> None:
     _call_api("terrain_helper", config, buffer=config.ucea.terrain_buffer_m)
     _call_api("weather_helper", config, weather=config.ucea.weather_source)
     _call_api("archetypes_mapper", config)
+
+
+def _configure_height_enrichment_paths(config: Configuration) -> None:
+    with config.ignore_restrictions():
+        zone_height_gpkg = str(config.zone_helper.building_height_gpkg).strip()
+        surroundings_height_gpkg = str(config.surroundings_helper.building_height_gpkg).strip()
+
+        if (not zone_height_gpkg or not surroundings_height_gpkg) and os.path.exists(DEFAULT_INE_HEIGHT_GPKG):
+            if not zone_height_gpkg:
+                config.zone_helper.building_height_gpkg = DEFAULT_INE_HEIGHT_GPKG
+                _log(f"Using default INE height GeoPackage for zone-helper: {DEFAULT_INE_HEIGHT_GPKG}")
+            if not surroundings_height_gpkg:
+                config.surroundings_helper.building_height_gpkg = DEFAULT_INE_HEIGHT_GPKG
+                _log(f"Using default INE height GeoPackage for surroundings-helper: {DEFAULT_INE_HEIGHT_GPKG}")
 
 
 def _resolve_comparison_root(config: Configuration, scenario: str) -> str:
@@ -349,6 +804,32 @@ def _run_python_module(module: str, args: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
+def _run_cea_script(script_name: str, scenario: str, extra_args: list[str] | None = None) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "cea.interfaces.cli.cli",
+        script_name,
+        "--scenario",
+        scenario,
+    ]
+    if extra_args:
+        command.extend(extra_args)
+    _log("Running command: " + " ".join(command))
+    subprocess.run(command, check=True)
+
+
+def _clean_solar_outputs(scenario: str) -> None:
+    targets = [
+        os.path.join(scenario, "outputs", "data", "solar-radiation"),
+        os.path.join(scenario, "outputs", "data", "potentials", "solar"),
+    ]
+    for target in targets:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+            _log(f"Removed stale output folder: {target}")
+
+
 def _select_building_for_3d(locator: InputLocator, preferred_building: str) -> str:
     preferred = preferred_building.strip()
     if preferred:
@@ -364,6 +845,51 @@ def _select_building_for_3d(locator: InputLocator, preferred_building: str) -> s
 
 
 def _run_experiments(config: Configuration, scenario: str) -> UceaRuntime:
+    if config.ucea.workflow1_only:
+        roof_file = _require_roof_file(scenario)
+        _log(f"Workflow1-only mode enabled. Using roof file: {roof_file}")
+        _clean_solar_outputs(scenario)
+
+        pv_panel = config.ucea.pv_panel
+        _run_cea_script("radiation", scenario)
+        _run_cea_script(
+            "photovoltaic",
+            scenario,
+            ["--panel-on-wall", "false", "--type-pvpanel", pv_panel],
+        )
+
+        locator = InputLocator(scenario)
+        building = _select_building_for_3d(locator, config.ucea.building_3d)
+        zone_pickle_dir = os.path.join(
+            scenario,
+            "outputs",
+            "data",
+            "solar-radiation",
+            "radiance_geometry_pickle",
+            "zone",
+        )
+        viewer_started = False
+        try:
+            _run_python_module(
+                "cea.resources.radiation.workflow1_building_viewer",
+                [
+                    "--zone-pickle-dir",
+                    zone_pickle_dir,
+                ],
+            )
+            viewer_started = True
+        except Exception as exc:
+            _log(f"Could not launch interactive workflow1 building viewer: {exc}")
+
+        return UceaRuntime(
+            scenario=scenario,
+            comparison_root="",
+            building=building,
+            output_figure="",
+            viewer_started=viewer_started,
+            comparison_ran=False,
+        )
+
     comparison_root = _resolve_comparison_root(config, scenario)
     roof_file = _require_roof_file(scenario)
     pv_panel = config.ucea.pv_panel
@@ -412,11 +938,28 @@ def _run_experiments(config: Configuration, scenario: str) -> UceaRuntime:
             output_figure,
         ],
     )
+
+    viewer_started = False
+    try:
+        # Open interactive workflow1 viewer with dropdown building selection.
+        _run_python_module(
+            "cea.resources.radiation.workflow1_building_viewer",
+            [
+                "--comparison-root",
+                comparison_root,
+            ],
+        )
+        viewer_started = True
+    except Exception as exc:
+        _log(f"Could not launch interactive workflow1 building viewer: {exc}")
+
     return UceaRuntime(
         scenario=scenario,
         comparison_root=comparison_root,
         building=building,
         output_figure=output_figure,
+        viewer_started=viewer_started,
+        comparison_ran=True,
     )
 
 
@@ -433,8 +976,16 @@ def _open_geojson_io(config: Configuration) -> None:
         _log(f"Could not open browser automatically: {exc}")
 
 
+def _resolve_scenario(config: Configuration) -> str:
+    configured_scenario = config.scenario.strip()
+    if configured_scenario:
+        return os.path.abspath(configured_scenario)
+    _log(f"No scenario provided. Using hard-coded default scenario: {DEFAULT_UCEA_SCENARIO}")
+    return os.path.abspath(DEFAULT_UCEA_SCENARIO)
+
+
 def main(config: Configuration) -> None:
-    scenario = os.path.abspath(config.scenario)
+    scenario = _resolve_scenario(config)
     os.makedirs(scenario, exist_ok=True)
     _log(f"Initialising experiment workflow for scenario: {scenario}")
 
@@ -456,11 +1007,17 @@ def main(config: Configuration) -> None:
     )
 
     _log("Run completed successfully.")
-    _log(f"Comparison output root: {runtime.comparison_root}")
-    _log(f"Scenario metrics: {os.path.join(runtime.comparison_root, 'scenario_metrics.csv')}")
-    _log(f"Building metrics: {os.path.join(runtime.comparison_root, 'building_metrics.csv')}")
-    _log(f"3D building used: {runtime.building}")
-    _log(f"3D figure: {runtime.output_figure}")
+    if runtime.comparison_ran:
+        _log(f"Comparison output root: {runtime.comparison_root}")
+        _log(f"Scenario metrics: {os.path.join(runtime.comparison_root, 'scenario_metrics.csv')}")
+        _log(f"Building metrics: {os.path.join(runtime.comparison_root, 'building_metrics.csv')}")
+        _log(f"3D building used: {runtime.building}")
+        _log(f"3D figure: {runtime.output_figure}")
+    else:
+        _log("Workflow1-only run completed (comparison and metrics were skipped).")
+        _log(f"3D building selected: {runtime.building}")
+    if runtime.viewer_started:
+        _log("Interactive workflow1 building viewer was launched.")
 
 
 if __name__ == "__main__":

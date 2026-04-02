@@ -1,0 +1,297 @@
+Guide: Surface Matching And Generation In fixedbox_html.py
+Source file: fixedbox_html.py
+Scope: only how buildings are matched and how roof surfaces are generated
+
+========================================================================
+1) What the relevant pipeline does
+========================================================================
+
+The relevant path in fixedbox_html.py is:
+
+1. Build predicted building objects from model output.
+2. Compute IoU between each OSM building and each predicted building.
+3. For each OSM building, pick the best prediction and keep it only if IoU > 0.3.
+4. For accepted matches, call topology_converter_mine(pred.raw_roof_data, osm_feat).
+5. topology_converter_mine generates roof surface meshes (PyVista) per face.
+6. Generated meshes are stored in face_data["intersections"] and rendered in render_3d_tiles().
+
+
+========================================================================
+2) Predicted building geometry used for matching
+========================================================================
+
+Code excerpt (fixedbox_html.py):
+
+class EstimatedBuilding:
+    def __init__(self):
+        self.box_coords_in_epsg_3763: list[float] = []
+        self.planes_in_physical_dimensions: list[RoofPlane] = []
+        self.raw_roof_data = []
+
+def convert_tensor_prediction_to_building(...):
+    cx_map = xmin_map + cx_norm * img_w * res
+    cy_map = ymax_map - cy_norm * img_h * res
+    w_map  = w_norm * img_w * res
+    h_map  = h_norm * img_h * res
+
+    self.box_coords_in_epsg_3763 = [
+        cx_map - w_map/2, cy_map - h_map/2,
+        cx_map + w_map/2, cy_map + h_map/2,
+    ]
+
+    probh, probtop, probright, probbottom, probleft = roof_prediction[0:5]
+    inc_top, inc_right, inc_bottom, inc_left = roof_prediction[10:14]
+    ori_top, ori_right, ori_bottom, ori_left = roof_prediction[14:18]
+
+What matters:
+- `box_coords_in_epsg_3763` is what matching uses.
+- `raw_roof_data` is what topology conversion uses to generate surfaces.
+- Coordinates are in EPSG:3763 before matching.
+
+
+========================================================================
+3) Matching OSM buildings to predictions
+========================================================================
+
+3.1 IoU calculation
+
+Code excerpt:
+
+def compute_area_overlap(osm_building, prediction_building) -> float:
+    tr = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+
+    xs, ys = zip(*[tr.transform(lon, lat)
+                   for lon, lat in osm_building["geometry"]["coordinates"][0]])
+    osm_box = [min(xs), min(ys), max(xs), max(ys)]
+    pred_box = prediction_building.box_coords_in_epsg_3763
+
+    ix0, iy0 = max(osm_box[0], pred_box[0]), max(osm_box[1], pred_box[1])
+    ix1, iy1 = min(osm_box[2], pred_box[2]), min(osm_box[3], pred_box[3])
+    inter_area = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+
+    area_osm  = (osm_box[2]  - osm_box[0])  * (osm_box[3]  - osm_box[1])
+    area_pred = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
+    union_area = area_osm + area_pred - inter_area
+    return inter_area / union_area if union_area > 0 else 0.0
+
+Important:
+- OSM polygon is transformed from EPSG:4326 to EPSG:3763.
+- IoU is bbox-vs-bbox in EPSG:3763.
+- It is not polygon-vs-polygon IoU.
+
+3.2 Matrix and selection
+
+Code excerpt:
+
+iou_mat = compute_iou_matrix(geojson['features'], buildings)
+matched_data = []
+
+for i, osm_feat in enumerate(geojson['features']):
+    best_match_idx = np.argmax(iou_mat[i, :])
+    if iou_mat[i, best_match_idx] > 0.3:
+        pred = buildings[best_match_idx]
+        outline,orientedbox,lines_world,code,face_data = topology_converter_mine(pred.raw_roof_data, osm_feat)
+        matched_data.append({
+            "osm_id": osm_feat["properties"].get("osm_id"),
+            "footprint": outline,
+            "roof_planes": orientedbox,
+            "lines_world": lines_world,
+            "code":code,
+            "face_data":face_data,
+        })
+
+Important:
+- One best prediction per OSM building.
+- Match accepted only when IoU > 0.3.
+- Only accepted matches generate roof surfaces.
+
+
+========================================================================
+4) Surface generation core: topology_converter_mine(...)
+========================================================================
+
+Entry excerpt:
+
+def topology_converter_mine(roof_prediction, osm_building):
+    tr = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    ring = osm_building["geometry"]["coordinates"][0]
+    xs, ys = zip(*[tr.transform(lon, lat) for lon, lat in ring])
+
+    points = outline[:2, :].T.astype(np.float32)
+    rect = cv2.minAreaRect(points)
+    center, (width, height), angle = rect
+
+What this means:
+- Uses OSM footprint as base shape.
+- Builds an oriented local rectangle using `minAreaRect`.
+- All topology splitting and face assignment happen in that local frame.
+
+
+========================================================================
+5) Face activation and topology code
+========================================================================
+
+Code excerpt:
+
+face_data = {
+    "T": {"active": remapped["T"] > 0.5, "inclination": remapped_inc["T"], "orientation": remapped_ori["T"]},
+    "R": {"active": remapped["R"] > 0.5, "inclination": remapped_inc["R"], "orientation": remapped_ori["R"]},
+    "B": {"active": remapped["B"] > 0.5, "inclination": remapped_inc["B"], "orientation": remapped_ori["B"]},
+    "L": {"active": remapped["L"] > 0.5, "inclination": remapped_inc["L"], "orientation": remapped_ori["L"]},
+    "H": {"active": probh > 0.5, "inclination": 0.0, "orientation": 0.0},
+}
+
+code = ""
+if probh > 0.5: code += "H"
+if remapped["T"] > 0.5: code += "T"
+if remapped["R"] > 0.5: code += "R"
+if remapped["B"] > 0.5: code += "B"
+if remapped["L"] > 0.5: code += "L"
+
+Important:
+- Face activation threshold is 0.5.
+- `code` selects which topology case is used (`"TR"`, `"HBL"`, `"HTRBL"`, etc).
+- Directional predictions are remapped to local building orientation before activation.
+
+
+========================================================================
+6) How each roof tile surface is geometrically created
+========================================================================
+
+6.1 Plane normal computation
+
+Code excerpt:
+
+def planenormal(face_id, inc, ori, axis_aligned_bounding_box_rotation):
+    tilt = inc * (math.pi / 2)
+    global_azimuth = (ori - 0.5) * (math.pi / 2) + base_ori_rad
+    azimuth = global_azimuth + axis_aligned_bounding_box_rotation
+    nz = math.cos(tilt)
+    nx = math.sin(tilt) * math.cos(azimuth)
+    ny = math.sin(tilt) * math.sin(azimuth)
+    return [nx, ny, nz]
+
+Meaning:
+- `inc` controls slope (0..1 mapped to 0..90 deg).
+- `ori` controls orientation around the face baseline.
+- Building rotation angle is injected into azimuth.
+
+6.2 Tile generation by extrusion + slice
+
+Code excerpt:
+
+def rooftile(corners, plane_point, plane_normal, height=1000.0):
+    pts = np.array(corners)
+    if pts.shape[1] == 2:
+        pts = np.column_stack([pts, np.zeros(len(pts))])
+
+    footprint = pv.PolyData(pts, faces=faces)
+    cuboid = footprint.extrude((0, 0, height), capping=True)
+    intersection_polygon = cuboid.slice(normal=plane_normal, origin=plane_point)
+    return intersection_polygon
+
+Meaning:
+- Start with a local 2D polygon patch.
+- Extrude vertically to a volume.
+- Slice with the face plane.
+- The slice result is the roof surface mesh for that patch.
+
+
+========================================================================
+7) How multi-face rooftops are partitioned
+========================================================================
+
+For multi-face codes, the converter:
+- defines split lines (depends on `code`),
+- splits the local rectangle with Shapely,
+- assigns each split part to a face by centroid,
+- builds that part's tile with the corresponding face normal.
+
+Code excerpts:
+
+def split_with_lines(corners, lines):
+    polys = [Polygon(corners)]
+    ...
+    result = split(poly, splitter)
+    ...
+    return [np.array(p.exterior.coords[:-1]) for p in polys]
+
+def determine_face_for_polygon(poly_centroid, corners, code):
+    ...
+    valid_distances = {face: dist for face, dist in distances.items() if face in code}
+    if valid_distances:
+        nearest_face = min(valid_distances, key=valid_distances.get)
+        return nearest_face
+
+Examples in match-case:
+- `case "TR"`: split with one diagonal and assign T vs R.
+- `case "HTRBL"`: multiple lines to create a complex hip-like partition.
+
+
+========================================================================
+8) Local -> world transformation of generated surfaces
+========================================================================
+
+Code excerpt:
+
+for face in intersections:
+    intersection = intersections[face]
+    intersection.rotate_z(angle, inplace=True)
+    intersection.translate([cx, cy, 0], inplace=True)
+
+face_data["intersections"] = intersections
+
+Meaning:
+- Tiles are generated in local coordinates first.
+- They are rotated and translated back to real EPSG:3763 coordinates.
+- Stored in `face_data["intersections"]`.
+
+
+========================================================================
+9) Where generated surfaces are consumed
+========================================================================
+
+`matched_data` carries the association and generated meshes.
+
+In 3D rendering:
+
+for entry in matched_data:
+    intersections = entry.get("face_data", {}).get("intersections", {})
+    if not intersections:
+        continue
+    for face_name, tile_mesh in intersections.items():
+        if tile_mesh is not None:
+            pl.add_mesh(tile_mesh.delaunay_2d(), style="surface", color=mappedcolors[face_name])
+
+So the visualized surfaces are exactly those generated in topology_converter_mine.
+
+
+========================================================================
+10) Important conceptual clarification
+========================================================================
+
+Question: "Is it creating equivalent geometries based on the surface area in each direction?"
+
+In this code, no explicit area-balancing optimization is performed.
+
+What it does:
+- Uses directional probabilities to decide active faces.
+- Uses predefined split templates per topology code.
+- Assigns parts by centroid rules.
+- Generates surfaces from those parts and face normals.
+
+What it does not do:
+- Solve for equal-area faces.
+- Fit areas to directional target ratios.
+- Run a global geometric optimization over roof surface area.
+
+
+========================================================================
+11) Quick debugging focus (matching + surfaces only)
+========================================================================
+
+1. If no surfaces render, check whether many OSM buildings fail IoU > 0.3.
+2. If matches exist but some buildings still have no surfaces, inspect:
+   - computed `code` in topology_converter_mine,
+   - whether the corresponding case is producing `intersections`.
+3. If intersections exist but view is empty, inspect tile validity before `delaunay_2d()`.

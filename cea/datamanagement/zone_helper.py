@@ -16,6 +16,7 @@ import pandas as pd
 import cea.config
 import cea.inputlocator
 from cea.datamanagement.databases_verification import COLUMNS_ZONE
+from cea.datamanagement.height_enrichment import enrich_building_heights_from_gpkg
 from cea.demand import constants
 from cea.datamanagement.constants import OSM_BUILDING_CATEGORIES, OTHER_OSM_CATEGORIES_UNCONDITIONED, GRID_SIZE_M, EARTH_RADIUS_M
 from cea.utilities.standardize_coordinates import get_projected_coordinate_system, get_geographic_coordinate_system, \
@@ -80,7 +81,7 @@ def assign_attributes(shapefile, buildings_height, buildings_floors, buildings_h
         if 'building:levels' not in list_of_columns or pd.isnull(shapefile['building:levels']).all():
             # if 'building:levels' is not in the database, make an assumption
             # if 'building:levels' are all NaN, make an assumption
-            shapefile['building:levels'] = 3 * no_buildings
+            shapefile['building:levels'] = [3] * no_buildings
             shapefile['reference'] = ["CEA Assumption"] * no_buildings
         elif 'height' in list_of_columns:
             # if either the 'building:levels' or the building 'height' are available, take them from OSM
@@ -336,6 +337,8 @@ def zone_helper(locator, config):
     year_construction = config.zone_helper.year_construction
     include_building_parts = config.zone_helper.include_building_parts
     fix_overlapping = config.zone_helper.fix_overlapping_geometries
+    building_height_gpkg = config.zone_helper.building_height_gpkg
+    ine_fallback_max_distance_m = config.zone_helper.ine_fallback_max_distance_m
     zone_output_path = locator.get_zone_geometry()
 
     # ensure folders exist
@@ -345,6 +348,7 @@ def zone_helper(locator, config):
     zone_df = polygon_to_zone(buildings_floors, buildings_floors_below_ground, buildings_height,
                               buildings_height_below_ground,
                               fix_overlapping, include_building_parts,
+                              building_height_gpkg, ine_fallback_max_distance_m,
                               poly)
 
     # USE_A zone.shp file contents to get the contents of occupancy.dbf and age.dbf
@@ -495,7 +499,7 @@ def calculate_age(zone_df, year_construction):
 
 
 def polygon_to_zone(buildings_floors, buildings_floors_below_ground, buildings_height, buildings_height_below_ground,
-                    fix_overlapping, include_building_parts, poly):
+                    fix_overlapping, include_building_parts, building_height_gpkg, ine_fallback_max_distance_m, poly):
 
     # get all footprints in the district tagged as 'building' or 'building:part' in OSM
     shapefile = osmnx.features_from_polygon(polygon=poly['geometry'].values[0], tags={"building": True})
@@ -522,6 +526,48 @@ def polygon_to_zone(buildings_floors, buildings_floors_below_ground, buildings_h
     # adding additional information from OSM
     # (e.g. house number, street number, postcode, if HDB for Singapore buildings)
     shapefile = assign_attributes_additional(shapefile)
+
+    reference_before = shapefile["reference"].fillna("").astype(str).copy() if "reference" in shapefile.columns else None
+    height_before = pd.to_numeric(shapefile["height_ag"], errors="coerce").copy() if "height_ag" in shapefile.columns else None
+
+    shapefile = enrich_building_heights_from_gpkg(
+        buildings=shapefile,
+        building_height_gpkg=building_height_gpkg,
+        fallback_max_distance_m=ine_fallback_max_distance_m,
+        reference_column="reference",
+    )
+
+    reference_after = shapefile["reference"].fillna("").astype(str) if "reference" in shapefile.columns else pd.Series(
+        [""] * shapefile.shape[0], index=shapefile.index
+    )
+    height_after = pd.to_numeric(shapefile["height_ag"], errors="coerce") if "height_ag" in shapefile.columns else pd.Series(
+        [np.nan] * shapefile.shape[0], index=shapefile.index
+    )
+
+    ine_direct_count = int((reference_after == "INE").sum())
+    ine_assumption_count = int((reference_after == "INE Assumption").sum())
+    if reference_before is None:
+        replaced_cea_assumption_count = 0
+    else:
+        replaced_cea_assumption_count = int(
+            ((reference_before == "CEA Assumption") & reference_after.isin(["INE", "INE Assumption"])).sum()
+        )
+
+    if height_before is None:
+        changed_height_count = 0
+    else:
+        changed_height_count = int(
+            (~height_before.fillna(np.nan).eq(height_after.fillna(np.nan))).sum()
+        )
+
+    print(
+        "Zone-helper height enrichment summary: "
+        f"INE={ine_direct_count}, "
+        f"INE Assumption={ine_assumption_count}, "
+        f"CEA Assumption replaced={replaced_cea_assumption_count}, "
+        f"heights changed={changed_height_count}, "
+        f"total buildings={shapefile.shape[0]}."
+    )
 
     # fix geometries of buildings with overlapping polygons
     if fix_overlapping is True:

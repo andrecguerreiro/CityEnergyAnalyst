@@ -1,0 +1,1804 @@
+import numpy as np
+from ultralytics import YOLO
+from owslib.wmts import WebMapTileService
+from PIL import Image
+import io
+import cv2
+import folium
+import math
+from pyproj import Transformer
+import requests
+import json
+import gradio as gr
+import os
+import hashlib
+
+## Listing of logic in the project
+'''
+We download high resolution satellite images. 
+From this images we retrieve predictions with our model.
+Then we retrieve the OSM buildings from openstreetmap.
+Then we match these buildings.
+We recreate a rooftop based on the building outline and the model prediction 
+We render it
+'''
+
+def wmts_tile_to_array(tile_data):
+    img = Image.open(io.BytesIO(tile_data.read()))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return np.array(img)
+
+def get_tile_indices(xmin, ymin, xmax, ymax, matrix):
+    tile_size = matrix.tilewidth * matrix.scaledenominator * 0.28e-3
+    origin_x, origin_y = matrix.topleftcorner
+    col_min = int((xmin - origin_x) // tile_size)
+    col_max = int((xmax - origin_x) // tile_size)
+    row_min = int((origin_y - ymax) // tile_size)
+    row_max = int((origin_y - ymin) // tile_size)
+    return col_min, col_max, row_min, row_max
+
+def retrieve_satelite_image(top_left_corner, bottom_right_corner,progress_cb = None):
+    wmts_url = (
+        "https://cartografia.dgterritorio.gov.pt/ortos2018/service"
+        "?service=WMTS&request=GetCapabilities"
+    )
+    wmts = WebMapTileService(wmts_url)
+
+    xmin, ymax = top_left_corner
+    xmax, ymin = bottom_right_corner
+
+    layer          = "Ortos2018-RGB"
+    tile_matrix_set = "PTTM_06"
+    zoom_level     = "14"
+    matrix   = wmts.tilematrixsets[tile_matrix_set].tilematrix[zoom_level]
+    res      = matrix.scaledenominator * 0.28e-3
+    tile_size_m = matrix.tilewidth * res
+
+    col_min, col_max, row_min, row_max = get_tile_indices(xmin, ymin, xmax, ymax, matrix)
+    n_rows = row_max + 1 - row_min
+    n_cols = col_max + 1 - col_min
+    total_tiles = n_rows * n_cols
+    processed_blocks = np.empty((n_rows, n_cols), dtype=object)
+
+    os.makedirs("cache/tiles", exist_ok=True)
+
+    done = 0
+    for row in range(row_min, row_max + 1):
+        for col in range(col_min, col_max + 1):
+            tile_filename = f"cache/tiles/tile_{zoom_level}_{row}_{col}.png"
+            if os.path.exists(tile_filename):
+                img_array = np.array(Image.open(tile_filename).convert("RGB"))
+            else:
+                tile = wmts.gettile(
+                    layer=layer, tilematrixset=tile_matrix_set,
+                    tilematrix=zoom_level, row=row, column=col, format="image/png",
+                )
+                img = Image.open(io.BytesIO(tile.read())).convert("RGB")
+                img.save(tile_filename) # Save to cache
+                img_array = np.array(img)
+            processed_blocks[row - row_min, col - col_min] = {"img": img_array}
+            done += 1
+            if progress_cb:
+                progress_cb(done, total_tiles)
+
+    block_h, block_w = processed_blocks[0, 0]["img"].shape[:2]
+    stitched = np.zeros((n_rows * block_h, n_cols * block_w, 3), dtype=np.uint8)
+    for row in range(n_rows):
+        for col in range(n_cols):
+            img = processed_blocks[row, col]["img"]
+            stitched[row*block_h:(row+1)*block_h, col*block_w:(col+1)*block_w] = img
+
+    origin_x = matrix.topleftcorner[0] + col_min * tile_size_m
+    origin_y = matrix.topleftcorner[1] - row_min * tile_size_m
+
+    col_start = int(round((xmin - origin_x) / res))
+    row_start = int(round((origin_y - ymax) / res))
+    col_end   = int(round((xmax - origin_x) / res))
+    row_end   = int(round((origin_y - ymin) / res))
+    satellite_image = stitched[row_start:row_end, col_start:col_end, :]
+
+    def conversion(x, y):
+        return int((x - xmin) / res), int((ymax - y) / res)
+
+    return satellite_image, res, conversion
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+class CachedModel:
+    def __init__(self):
+        self.model = YOLO("best.pt")
+        self.model.to("cpu")
+        self.model.eval()
+
+class RoofPlane:
+    def __init__(self, face, probability, corners, normal, inclination, orientation):
+        self.face = face;  self.probability = probability
+        self.corners = corners;  self.normal = normal
+        self.inclination = inclination;  self.orientation = orientation
+
+class EstimatedBuilding:
+    def __init__(self):
+        self.box_coords_in_epsg_3763: list[float] = []
+        self.planes_in_physical_dimensions: list[RoofPlane] = []
+        self.raw_roof_data = []
+
+    def convert_tensor_prediction_to_building(
+        self, boxes_xywhn, roof_prediction, top_left_corner, res, image_shape
+    ):
+        self.raw_roof_data = roof_prediction
+        img_h, img_w = image_shape[:2]
+        xmin_map, ymax_map = top_left_corner
+        cx_norm, cy_norm, w_norm, h_norm = boxes_xywhn
+        cx_map = xmin_map + cx_norm * img_w * res
+        cy_map = ymax_map - cy_norm * img_h * res
+        w_map  = w_norm * img_w * res
+        h_map  = h_norm * img_h * res
+
+        self.box_coords_in_epsg_3763 = [
+            cx_map - w_map/2, cy_map - h_map/2,
+            cx_map + w_map/2, cy_map + h_map/2,
+        ]
+
+        probh, probtop, probright, probbottom, probleft = roof_prediction[0:5]
+        ah, atop, aright, abottom, aleft = roof_prediction[5:10]
+        inc_top, inc_right, inc_bottom, inc_left = roof_prediction[10:14]
+        ori_top, ori_right, ori_bottom, ori_left = roof_prediction[14:18]
+
+        dx, dy = w_map/2, h_map/2
+        p_tl = np.array([cx_map-dx, cy_map+dy, 0.])
+        p_tr = np.array([cx_map+dx, cy_map+dy, 0.])
+        p_br = np.array([cx_map+dx, cy_map-dy, 0.])
+        p_bl = np.array([cx_map-dx, cy_map-dy, 0.])
+
+        for face_name, prob, inc, ori, base_az, ps, pe in [
+            ("top",    probtop,    inc_top,    ori_top,     math.pi/2,  p_tl, p_tr),
+            ("right",  probright,  inc_right,  ori_right,   0.,         p_tr, p_br),
+            ("bottom", probbottom, inc_bottom, ori_bottom, -math.pi/2,  p_br, p_bl),
+            ("left",   probleft,   inc_left,   ori_left,    math.pi,    p_bl, p_tl),
+        ]:
+            if prob < 0.5: continue
+            tilt    = inc * (math.pi/2)
+            azimuth = (ori - 0.5) * (math.pi/2) + base_az
+            normal  = np.array([math.sin(tilt)*math.cos(azimuth),
+                                 math.sin(tilt)*math.sin(azimuth),
+                                 math.cos(tilt)])
+            normal /= np.linalg.norm(normal)
+            edge_unit = (pe - ps) / np.linalg.norm(pe - ps)
+            slope_vec = np.cross(edge_unit, normal)
+            if slope_vec[2] > 0: slope_vec = -slope_vec
+            sl = max(w_map, h_map) * 0.2
+            self.planes_in_physical_dimensions.append(RoofPlane(
+                face=face_name, probability=float(prob),
+                corners=[ps, pe, pe+slope_vec*sl, ps+slope_vec*sl],
+                normal=normal, inclination=float(inc), orientation=float(ori),
+            ))
+
+def _iter_tiles(image, top_left_corner, res, tile_px, overlap=0.2):
+    """
+    Yield (tile_img, tile_top_left_corner) for every window position.
+ 
+    Parameters
+    ----------
+    image           : np.ndarray  full satellite image (H, W, 3)
+    top_left_corner : (x, y)      EPSG:3763 coords of the image top-left pixel
+    res             : float        metres per pixel
+    tile_px         : int          tile side in pixels (match your model input, e.g. 640)
+    overlap         : float        fractional overlap between adjacent tiles (0.0–0.5)
+    """
+    img_h, img_w = image.shape[:2]
+    stride = int(tile_px * (1.0 - overlap))   # pixels between tile starts
+    tl_x, tl_y = top_left_corner
+ 
+    row_start = 0
+    while True:
+        row_end = row_start + tile_px
+        # Clamp so we never go out of bounds; shift start back instead
+        if row_end > img_h:
+            row_start = max(0, img_h - tile_px)
+            row_end   = img_h
+ 
+        col_start = 0
+        while True:
+            col_end = col_start + tile_px
+            if col_end > img_w:
+                col_start = max(0, img_w - tile_px)
+                col_end   = img_w
+ 
+            tile_img = image[row_start:row_end, col_start:col_end]
+ 
+            # EPSG:3763 top-left of THIS tile
+            tile_tl_x = tl_x + col_start * res
+            tile_tl_y = tl_y - row_start * res   # y decreases downward
+ 
+            yield tile_img, (tile_tl_x, tile_tl_y)
+ 
+            if col_end == img_w:
+                break
+            col_start += stride
+ 
+        if row_end == img_h:
+            break
+        row_start += stride
+ 
+ 
+# ── 2. Per-box IoU in EPSG:3763 ───────────────────────────────────────────────
+ 
+def _box_iou(box_a, box_b):
+    """
+    box = [xmin, ymin, xmax, ymax] in EPSG:3763 metres.
+    Returns IoU scalar.
+    """
+    # axis-aligned box IoU: overlap area / union area
+    ix = max(0.0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    iy = max(0.0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+    inter = ix * iy
+    area_a = (box_a[2]-box_a[0]) * (box_a[3]-box_a[1])
+    area_b = (box_b[2]-box_b[0]) * (box_b[3]-box_b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+ 
+ 
+# ── 3. Global NMS over EstimatedBuilding list ─────────────────────────────────
+ 
+def _nms_predictions(predictions, iou_threshold=0.5):
+    """
+    Greedy NMS over all EstimatedBuilding objects using box_coords_in_epsg_3763.
+    Buildings are sorted by the max roof-plane probability (proxy for confidence).
+    Returns a filtered list with duplicates removed.
+    """
+    if not predictions:
+        return []
+ 
+    # Sort descending by best roof-face probability as a confidence proxy
+    def _score(b):
+        if len(b.planes_in_physical_dimensions) == 0:
+            return 0.0
+        return max(p.probability for p in b.planes_in_physical_dimensions)
+ 
+    ranked = sorted(predictions, key=_score, reverse=True)
+    kept   = []
+ 
+    for candidate in ranked:
+        box_c = candidate.box_coords_in_epsg_3763
+        suppressed = False
+        for accepted in kept:
+            box_a = accepted.box_coords_in_epsg_3763
+            if _box_iou(box_c, box_a) > iou_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            kept.append(candidate)
+ 
+    return kept
+  
+def retrieve_prediction_list(
+    satellite_image,
+    top_left_corner,
+    res,
+    building_threshold,
+    overlap_threshold,
+    cached_model,
+    tile_overlap=0.2,
+    nms_iou=0.5,
+):
+    """
+    Tiled inference replacement.
+ 
+    Extra parameters vs. original
+    ------------------------------
+    tile_px      : model input size in pixels (default 640)
+    tile_overlap : fractional overlap between adjacent tiles (default 0.2 = 20 %)
+    nms_iou      : IoU threshold for cross-tile duplicate suppression (default 0.5)
+    """
+    img_h, img_w = satellite_image.shape[:2]
+    all_predictions = []
+    tile_idx = 0
+ 
+    for tile_img, tile_tl in _iter_tiles(
+        satellite_image, top_left_corner, res, cached_model.model.model.args.get('imgsz', 640), tile_overlap
+    ):
+        tile_idx += 1
+        print(f"  🔲 Tile {tile_idx} — tl=({tile_tl[0]:.0f}, {tile_tl[1]:.0f}), "
+              f"size={tile_img.shape[1]}×{tile_img.shape[0]}")
+ 
+        results = cached_model.model(
+            tile_img,
+            conf=building_threshold,
+            iou=overlap_threshold,   # within-tile NMS, same as before
+        )[0]
+ 
+        for i in range(results.boxes.shape[0]):
+            b = EstimatedBuilding()
+            b.convert_tensor_prediction_to_building(
+                boxes_xywhn=np.array(results.boxes[i].xywhn[0]),
+                roof_prediction=np.array(sigmoid(results.roof.data[i, :])),
+                top_left_corner=tile_tl,
+                res=res,
+                image_shape=tile_img.shape,
+            )
+            all_predictions.append(b)
+ 
+    print(f"  📦 {len(all_predictions)} raw detections across {tile_idx} tile(s)")
+    final = _nms_predictions(all_predictions, iou_threshold=nms_iou)
+    print(f"  ✅ {len(final)} after global NMS (iou≥{nms_iou})")
+    return final
+
+def non_retrieve_prediction_list(satellite_image, top_left_corner, res,
+                              building_threshold, overlap_threshold, cached_model):
+    results = cached_model.model(satellite_image, conf=building_threshold,
+                                  iou=overlap_threshold)[0]
+    predictions = []
+    for i in range(results.boxes.shape[0]):
+        b = EstimatedBuilding()
+        b.convert_tensor_prediction_to_building(
+            boxes_xywhn=np.array(results.boxes[i].xywhn[0]),
+            roof_prediction=np.array(sigmoid(results.roof.data[i, :])),
+            top_left_corner=top_left_corner, res=res,
+            image_shape=satellite_image.shape,
+        )
+        predictions.append(b)
+    return predictions
+
+def get_osm_buildings(top_left_corner, bottom_right_corner):
+    tr = Transformer.from_crs("EPSG:3763", "EPSG:4326", always_xy=True)
+    tl_lon, tl_lat = tr.transform(*top_left_corner)
+    br_lon, br_lat = tr.transform(*bottom_right_corner)
+    s, n = min(tl_lat, br_lat), max(tl_lat, br_lat)
+    w, e = min(tl_lon, br_lon), max(tl_lon, br_lon)
+    q = f"""[out:json];(way["building"]({s},{w},{n},{e});
+    relation["building"]({s},{w},{n},{e}););out body;>;out skel qt;"""
+    r = requests.post("https://overpass-api.de/api/interpreter", data=q)
+    r.raise_for_status()
+    data  = r.json()
+    nodes = {el["id"]: (el["lon"], el["lat"]) for el in data["elements"] if el["type"]=="node"}
+    features = []
+    for el in data["elements"]:
+        if el["type"] != "way": continue
+        coords = [nodes[nid] for nid in el["nodes"] if nid in nodes]
+        if len(coords) < 3: continue
+        features.append({"type":"Feature",
+                          "properties":{"osm_id":el["id"], **el.get("tags",{})},
+                          "geometry":{"type":"Polygon","coordinates":[coords]}})
+    return {"type":"FeatureCollection","features":features}
+
+def get_osm_buildings_cached(top_left, bottom_right):
+    os.makedirs("cache/osm", exist_ok=True)
+    
+    # Create a unique ID based on the coordinates
+    coord_str = f"{top_left}_{bottom_right}"
+    cache_key = hashlib.md5(coord_str.encode()).hexdigest()
+    cache_path = f"cache/osm/{cache_key}.json"
+
+    if os.path.exists(cache_path):
+        print(f"📦 Loading OSM data from cache: {cache_path}")
+        with open(cache_path, "r") as f:
+            return json.load(f)
+
+    # If not cached, fetch it
+    data = get_osm_buildings(top_left, bottom_right)
+    
+    with open(cache_path, "w") as f:
+        json.dump(data, f)
+    return data
+
+import numpy as np
+import math
+from pyproj import Transformer
+from shapely.geometry import Polygon, LineString
+from shapely.ops import split
+import cv2
+
+def planenormal(face_id, inc, ori,axis_aligned_bounding_box_rotation):
+    # user of this code! be aware, it took me a billion years to catch this discusting error
+    # caused by the axis_aligned_bounding_box_rotation. Appreciate my sacrifice for your benefit!
+    if face_id == "T":
+        base_ori_rad = math.pi / 2
+    elif face_id == "B":
+        base_ori_rad = -math.pi / 2 
+    elif face_id == "R":
+        base_ori_rad = 0 
+    elif face_id == "L":
+        base_ori_rad = math.pi 
+    elif face_id == "H":
+        return [0, 0, 1]
+    else:
+        return None
+ 
+    # inc 0-1 -> 0-90 degrees
+    tilt = inc * (math.pi / 2)
+    # ori 0-1 -> -45 to +45 degrees relative to base_ori
+    # TODO emergency - remove this--- just for testing
+    # ori = 0.5
+    global_azimuth = (ori - 0.5) * (math.pi / 2) + base_ori_rad
+    azimuth = global_azimuth + axis_aligned_bounding_box_rotation
+    nz = math.cos(tilt)
+    nx = math.sin(tilt) * math.cos(azimuth)
+    ny = math.sin(tilt) * math.sin(azimuth)
+    
+    return [nx, ny, nz]
+ 
+def split_with_lines(corners, lines):
+    """Split a polygon defined by corners using a list of lines"""
+    polys = [Polygon(corners)]
+ 
+    for line in lines:
+        new_polys = []
+        splitter = LineString(line)
+ 
+        for poly in polys:
+            result = split(poly, splitter)
+ 
+            if len(result.geoms) > 1:
+                new_polys.extend(result.geoms)
+            else:
+                new_polys.append(poly)
+ 
+        polys = new_polys
+ 
+    return [np.array(p.exterior.coords[:-1]) for p in polys]
+ 
+def determine_face_for_polygon(poly_centroid, corners, code):
+    """
+    Determine which face a polygon belongs to based on its centroid position.
+    Returns the face identifier (e.g., 'T', 'R', 'B', 'L', 'H')
+    
+    corners: [[x_min_l, y_min_l], [x_max_l, y_min_l], [x_max_l, y_max_l], [x_min_l, y_max_l]]
+    """
+    x_min_l, y_min_l = corners[0]
+    x_max_l, y_max_l = corners[2]
+    cx, cy = poly_centroid
+    
+    # For cases with H (horizontal/flat), check if centroid is near center
+    if 'H' in code:
+        # Define a central region
+        center_threshold = 0.3  # 30% of dimension from center
+        x_center_min = x_min_l + (x_max_l - x_min_l) * (0.5 - center_threshold)
+        x_center_max = x_min_l + (x_max_l - x_min_l) * (0.5 + center_threshold)
+        y_center_min = y_min_l + (y_max_l - y_min_l) * (0.5 - center_threshold)
+        y_center_max = y_min_l + (y_max_l - y_min_l) * (0.5 + center_threshold)
+        
+        if (x_center_min <= cx <= x_center_max and y_center_min <= cy <= y_center_max):
+            return 'H'
+    
+    # Otherwise, determine by position relative to edges
+    # Calculate distances to each edge
+    dist_to_top = abs(cy - y_max_l)
+    dist_to_bottom = abs(cy - y_min_l)
+    dist_to_right = abs(cx - x_max_l)
+    dist_to_left = abs(cx - x_min_l)
+    
+    # Find the nearest edge
+    distances = {
+        'T': dist_to_top,
+        'B': dist_to_bottom,
+        'R': dist_to_right,
+        'L': dist_to_left
+    }
+    
+    # Only consider faces that are in the code
+    valid_distances = {face: dist for face, dist in distances.items() if face in code}
+    
+    if valid_distances:
+        nearest_face = min(valid_distances, key=valid_distances.get)
+        return nearest_face
+    
+    # Fallback: use quadrant-based logic
+    if cx >= 0 and cy >= 0:
+        return 'T' if 'T' in code else ('R' if 'R' in code else 'H')
+    elif cx >= 0 and cy < 0:
+        return 'R' if 'R' in code else ('B' if 'B' in code else 'H')
+    elif cx < 0 and cy < 0:
+        return 'B' if 'B' in code else ('L' if 'L' in code else 'H')
+    else:  # cx < 0 and cy >= 0
+        return 'L' if 'L' in code else ('T' if 'T' in code else 'H')
+ 
+def rooftile(corners, plane_point, plane_normal, height=1000.0):
+    """
+    This function should use PyVista to compute the intersection.
+    Since we're providing example logic, we'll return a placeholder.
+    """
+    import pyvista as pv
+    
+    pts = np.array(corners)
+    if pts.shape[1] == 2:
+        pts = np.column_stack([pts, np.zeros(len(pts))])
+    
+    # Create a closed loop polygon
+    n_pts = len(pts)
+    faces = [n_pts] + list(range(n_pts))
+    footprint = pv.PolyData(pts, faces=faces)
+    
+    # Extrude to create a cuboid
+    cuboid = footprint.extrude((0, 0, height), capping=True)
+    
+    # Slice with the plane
+    intersection_polygon = cuboid.slice(normal=plane_normal, origin=plane_point)
+    
+    return intersection_polygon
+ 
+def topology_converter_mine(roof_prediction, osm_building):
+    """
+    Convert roof predictions to topology with plane intersections.
+    
+    Returns:
+        outline: Building outline in 3D
+        rect: Oriented bounding box (center, size, angle)
+        lines_world: Dividing lines in world coordinates
+        code: Roof topology code (e.g., "HTRBL")
+        face_data: Dictionary of face data including intersections
+    """
+    tr = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    ring = osm_building["geometry"]["coordinates"][0]
+    xs, ys = zip(*[tr.transform(lon, lat) for lon, lat in ring])
+ 
+    outline = np.concatenate((np.array(xs), np.array(ys), np.zeros_like(np.array(xs))), axis=0)
+    outline = outline.reshape(3, -1)
+ 
+    probh, probtop, probright, probbottom, probleft = roof_prediction[0:5]
+    ah, atop, aright, abottom, aleft = roof_prediction[5:10]
+    inc_top, inc_right, inc_bottom, inc_left = roof_prediction[10:14]
+    ori_top, ori_right, ori_bottom, ori_left = roof_prediction[14:18]
+ 
+    points = outline[:2, :].T.astype(np.float32)
+    rect = cv2.minAreaRect(points)
+    center, (width, height), angle = rect
+    print(f"Code angle: {angle}°")
+ 
+    x_min_l = -width / 2.0
+    x_max_l = width / 2.0
+    y_min_l = -height / 2.0
+    y_max_l = height / 2.0
+ 
+    theta = math.radians(angle)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+ 
+    global_dirs = {
+        "T": np.array([0., 1.]),
+        "R": np.array([1., 0.]),
+        "B": np.array([0., -1.]),
+        "L": np.array([-1., 0.]),
+    }
+    global_probs = {"T": probtop, "R": probright, "B": probbottom, "L": probleft}
+    global_inc = {"T": inc_top, "R": inc_right, "B": inc_bottom, "L": inc_left}
+    global_ori = {"T": ori_top, "R": ori_right, "B": ori_bottom, "L": ori_left}
+ 
+    local_faces = {
+        "T": np.array([-sin_t, cos_t]),
+        "R": np.array([cos_t, sin_t]),
+        "L": np.array([-cos_t, -sin_t]),
+        "B": np.array([sin_t, -cos_t]),
+    }
+ 
+    remapped = {}
+    remapped_inc = {}
+    remapped_ori = {}
+    for local_name, local_vec in local_faces.items():
+        best_face = max(global_dirs, key=lambda g: np.dot(local_vec, global_dirs[g]))
+        remapped[local_name] = global_probs[best_face]
+        remapped_inc[local_name] = global_inc[best_face]
+        remapped_ori[local_name] = global_ori[best_face]
+ 
+    face_data = {
+        "T": {"active": remapped["T"] > 0.5, "inclination": remapped_inc["T"], "orientation": remapped_ori["T"]},
+        "R": {"active": remapped["R"] > 0.5, "inclination": remapped_inc["R"], "orientation": remapped_ori["R"]},
+        "B": {"active": remapped["B"] > 0.5, "inclination": remapped_inc["B"], "orientation": remapped_ori["B"]},
+        "L": {"active": remapped["L"] > 0.5, "inclination": remapped_inc["L"], "orientation": remapped_ori["L"]},
+        "H": {"active": probh > 0.5, "inclination": 0.0, "orientation": 0.0},
+    }
+ 
+    code = ""
+    if probh > 0.5: code += "H"
+    if remapped["T"] > 0.5: code += "T"
+    if remapped["R"] > 0.5: code += "R"
+    if remapped["B"] > 0.5: code += "B"
+    if remapped["L"] > 0.5: code += "L"
+    print(f"Roof code (local frame): {code}")
+ 
+    lines = []
+    corners = np.array([
+        [x_min_l, y_min_l],
+        [x_max_l, y_min_l],
+        [x_max_l, y_max_l],
+        [x_min_l, y_max_l],
+    ])
+    
+    # Dictionary to store computed intersections
+    intersections = {}
+    
+    # Base height for plane intersections
+    base_height = 10.0
+    
+    # Process each topology case
+    match code:
+        case "L":
+            normal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            intersections["L"] = rooftile(corners, np.array([0, 0, base_height]), normal)
+            
+        case "B":
+            normal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            intersections["B"] = rooftile(corners, np.array([0, 0, base_height]), normal)
+            
+        case "R":
+            normal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            intersections["R"] = rooftile(corners, np.array([0, 0, base_height]), normal)
+            
+        case "T":
+            normal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            intersections["T"] = rooftile(corners, np.array([0, 0, base_height]), normal)
+            
+        case "H":
+            normal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            intersections["H"] = rooftile(corners, np.array([0, 0, base_height]), normal)
+            
+        case "BL":
+            lines.append([[x_min_l, y_max_l], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for part in parts:
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "B":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Bnormal)
+                elif face == "L":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Lnormal)
+                    
+        case "RL":
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "R":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Rnormal)
+                elif face == "L":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Lnormal)
+                    
+        case "RB":
+            lines.append([[x_min_l, y_min_l], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "R":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Rnormal)
+                elif face == "B":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Bnormal)
+                    
+        case "HL":
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "H":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Hnormal)
+                elif face == "L":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Lnormal)
+                    
+        case "HB":
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "H":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Hnormal)
+                elif face == "B":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Bnormal)
+                    
+        case "TL":
+            lines.append([[x_min_l, y_min_l], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "T":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Tnormal)
+                elif face == "L":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Lnormal)
+                    
+        case "TB":
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "T":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Tnormal)
+                elif face == "B":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Bnormal)
+                    
+        case "TR":
+            lines.append([[x_min_l, y_max_l], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "T":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Tnormal)
+                elif face == "R":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Rnormal)
+                    
+        case "HR":
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "H":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Hnormal)
+                elif face == "R":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Rnormal)
+                    
+        case "HT":
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                if face == "H":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Hnormal)
+                elif face == "T":
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), Tnormal)
+                    
+        case "RBL":
+            lines.append([[0, y_min_l], [x_min_l, y_max_l]])
+            lines.append([[0, y_min_l], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"R": Rnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "TBL":
+            lines.append([[x_max_l, 0], [x_min_l, y_min_l]])
+            lines.append([[x_max_l, 0], [x_min_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"T": Tnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "TRL":
+            lines.append([[0, y_max_l], [x_min_l, y_min_l]])
+            lines.append([[0, y_max_l], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"T": Tnormal, "R": Rnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "TRB":
+            lines.append([[x_min_l, 0], [x_max_l, y_min_l]])
+            lines.append([[x_min_l, 0], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"T": Tnormal, "R": Rnormal, "B": Bnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTL":
+            lines.append([[0, 0], [x_min_l, y_min_l]])
+            lines.append([[x_min_l, y_max_l], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTB":
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            lines.append([[0, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "B": Bnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HBL":
+            lines.append([[x_min_l, y_min_l], [x_max_l, y_max_l]])
+            lines.append([[0, 0], [x_min_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HRL":
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            lines.append([[0, 0], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "R": Rnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HRB":
+            lines.append([[x_min_l, y_max_l], [x_max_l, y_min_l]])
+            lines.append([[0, 0], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "R": Rnormal, "B": Bnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTR":
+            lines.append([[x_min_l, y_min_l], [x_max_l, y_max_l]])
+            lines.append([[0, 0], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "R": Rnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "TRBL":
+            lines.append([[x_min_l, y_min_l], [x_max_l, y_max_l]])
+            lines.append([[x_min_l, y_max_l], [x_max_l, y_min_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"T": Tnormal, "R": Rnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HRBL":
+            lines.append([[0, 0], [x_min_l, y_max_l]])
+            lines.append([[0, 0], [x_max_l, y_max_l]])
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "R": Rnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTBL":
+            lines.append([[0, 0], [x_min_l, y_min_l]])
+            lines.append([[0, 0], [x_max_l, y_max_l]])
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTRL":
+            lines.append([[0, 0], [x_min_l, y_min_l]])
+            lines.append([[0, 0], [x_max_l, y_min_l]])
+            lines.append([[x_min_l, 0], [x_max_l, 0]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "R": Rnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTRB":
+            lines.append([[0, 0], [x_max_l, y_min_l]])
+            lines.append([[0, 0], [x_max_l, y_max_l]])
+            lines.append([[0, y_min_l], [0, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "R": Rnormal, "B": Bnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+                    
+        case "HTRBL":
+            # Complex hip roof with ridge
+            lines.append([[0.5*x_min_l, 0.5*y_min_l], [0.5*x_min_l, 0.5*y_max_l]])
+            lines.append([[0.5*x_max_l, 0.5*y_min_l], [0.5*x_max_l, 0.5*y_max_l]])
+            lines.append([[0.5*x_min_l, 0.5*y_min_l], [0.5*x_max_l, 0.5*y_min_l]])
+            lines.append([[0.5*x_min_l, 0.5*y_max_l], [0.5*x_max_l, 0.5*y_max_l]])
+            lines.append([[0.5*x_min_l, 0.5*y_min_l], [x_min_l, y_min_l]])
+            lines.append([[0.5*x_max_l, 0.5*y_min_l], [x_max_l, y_min_l]])
+            lines.append([[0.5*x_min_l, 0.5*y_max_l], [x_min_l, y_max_l]])
+            lines.append([[0.5*x_max_l, 0.5*y_max_l], [x_max_l, y_max_l]])
+            parts = split_with_lines(corners, lines)
+            
+            Hnormal = planenormal("H", face_data["H"]["inclination"], face_data["H"]["orientation"],theta)
+            Tnormal = planenormal("T", face_data["T"]["inclination"], face_data["T"]["orientation"],theta)
+            Rnormal = planenormal("R", face_data["R"]["inclination"], face_data["R"]["orientation"],theta)
+            Bnormal = planenormal("B", face_data["B"]["inclination"], face_data["B"]["orientation"],theta)
+            Lnormal = planenormal("L", face_data["L"]["inclination"], face_data["L"]["orientation"],theta)
+            
+            for i, part in enumerate(parts):
+                centroid = np.mean(part, axis=0)
+                face = determine_face_for_polygon(centroid, corners, code)
+                normal = {"H": Hnormal, "T": Tnormal, "R": Rnormal, "B": Bnormal, "L": Lnormal}.get(face)
+                if normal is not None:
+                    intersections[face] = rooftile(part, np.array([0, 0, base_height]), normal)
+    
+    # Convert lines to world coordinates
+    cx, cy = center
+    for face in intersections:
+        # Double the count of every intersection
+        intersection = intersections[face]
+        intersection.rotate_z(angle, inplace=True)
+        intersection.translate([cx, cy, 0], inplace=True)
+
+    # Store intersections in face_data
+    face_data["intersections"] = intersections
+
+    def local_to_world(pt):
+        xl, yl = pt
+        xw = cx + xl * cos_t - yl * sin_t
+        yw = cy + xl * sin_t + yl * cos_t
+        return [xw, yw]
+ 
+    lines_world = [[local_to_world(p0), local_to_world(p1)] for p0, p1 in lines]
+ 
+    return outline, rect, lines_world, code, face_data
+
+from pyproj import Transformer
+import numpy as np
+
+def compute_iou_matrix(osm_buildings, predictions):
+    osm_boxes = []
+    _TR_4326_TO_3763 = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    for feat in osm_buildings:
+        xs, ys = zip(*[_TR_4326_TO_3763.transform(lon, lat)
+                    for lon, lat in feat["geometry"]["coordinates"][0]])
+        osm_boxes.append([min(xs), min(ys), max(xs), max(ys)])
+
+    iou_mat = np.zeros((len(osm_boxes), len(predictions)))
+    for i, osm_box in enumerate(osm_boxes):
+        for j, pred in enumerate(predictions):
+            pred_box = pred.box_coords_in_epsg_3763
+            ix0 = max(osm_box[0], pred_box[0])
+            iy0 = max(osm_box[1], pred_box[1])
+            ix1 = min(osm_box[2], pred_box[2])
+            iy1 = min(osm_box[3], pred_box[3])
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            area_osm  = (osm_box[2] - osm_box[0]) * (osm_box[3] - osm_box[1])
+            area_pred = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
+            union = area_osm + area_pred - inter
+            iou_mat[i, j] = inter / union if union > 0 else 0.0
+    return iou_mat
+
+def build_map_html(osm_geojson, predicted_buildings, satellite_image,
+                   top_left_corner, bottom_right_corner, matched_data=None):
+    tr = Transformer.from_crs("EPSG:3763", "EPSG:4326", always_xy=True)
+
+    def box_poly(box):
+        x0,y0,x1,y1 = box
+        return [tr.transform(x,y)[::-1] for x,y in [(x0,y1),(x1,y1),(x1,y0),(x0,y0),(x0,y1)]]
+
+    lats, lons = [], []
+    for f in osm_geojson["features"]:
+        for lon, lat in f["geometry"]["coordinates"][0]:
+            lats.append(lat); lons.append(lon)
+    center = [sum(lats)/len(lats), sum(lons)/len(lons)]
+
+    m = folium.Map(location=center, zoom_start=18, tiles="OpenStreetMap")
+
+    tl_lon, tl_lat = tr.transform(*top_left_corner)
+    br_lon, br_lat = tr.transform(*bottom_right_corner)
+    s,n = min(tl_lat,br_lat), max(tl_lat,br_lat)
+    w,e = min(tl_lon,br_lon), max(tl_lon,br_lon)
+
+    sat = folium.FeatureGroup(name="Satellite Image")
+    folium.raster_layers.ImageOverlay(image=satellite_image,
+        bounds=[[s,w],[n,e]], opacity=0.85,
+        interactive=False, cross_origin=False).add_to(sat)
+    sat.add_to(m)
+
+    osm = folium.FeatureGroup(name="OSM Buildings")
+    folium.GeoJson(osm_geojson,
+        style_function=lambda _: {"fillColor":"#3388ff","color":"#1a55cc",
+                                   "weight":2,"fillOpacity":0.3},
+        tooltip=folium.GeoJsonTooltip(fields=["osm_id","building"],
+                                       aliases=["OSM ID","Type"], localize=True)
+    ).add_to(osm)
+    osm.add_to(m)
+
+    pred = folium.FeatureGroup(name="Model Predictions")
+    for i, building in enumerate(predicted_buildings):
+        if not building.box_coords_in_epsg_3763: continue
+        n_planes = len(building.planes_in_physical_dimensions)
+        folium.Polygon(locations=box_poly(building.box_coords_in_epsg_3763),
+            color="#cc0000", fill_color="#ff4444", fill_opacity=0.3, weight=2,
+            tooltip=f"Building {i} — {n_planes} roof plane(s)").add_to(pred)
+        for plane in building.planes_in_physical_dimensions:
+            cx = sum(p[0] for p in plane.corners)/4
+            cy = sum(p[1] for p in plane.corners)/4
+            lon, lat = tr.transform(cx, cy)
+            folium.CircleMarker(location=[lat,lon], radius=4,
+                color="#ff9900", fill=True, fill_opacity=0.8,
+                tooltip=(f"Face: {plane.face}<br>Prob: {plane.probability:.2f}<br>"
+                         f"Inc: {plane.inclination:.2f}<br>Ori: {plane.orientation:.2f}")
+            ).add_to(pred)
+    pred.add_to(m)
+
+    # Minimum bounding boxes (rotated rectangles from cv2.minAreaRect)
+    if matched_data:
+        mbb = folium.FeatureGroup(name="Min Bounding Boxes")
+        for entry in matched_data:
+            oriented_rect = entry.get("roof_planes")
+            if oriented_rect is None:
+                continue
+            # cv2.boxPoints returns the 4 corners of the rotated rectangle in EPSG:3763
+            corners_3763 = cv2.boxPoints(oriented_rect).astype(float)  # shape (4, 2)
+            # Close the ring by appending the first point again
+            corners_latlon = []
+            for x, y in corners_3763:
+                lon, lat = tr.transform(x, y)
+                corners_latlon.append([lat, lon])
+            corners_latlon.append(corners_latlon[0])  # close polygon
+            osm_id = entry.get("osm_id", "?")
+            _, (w_rect, h_rect), angle = oriented_rect
+            folium.Polygon(
+                locations=corners_latlon,
+                color="#00cc66", fill_color="#00ff88", fill_opacity=0.25, weight=2,
+                dash_array="6",
+                tooltip=(f"OSM {osm_id} — Min Bounding Box<br>"
+                         f"W: {w_rect:.1f} m  H: {h_rect:.1f} m<br>"
+                         f"Angle: {angle:.1f}°"
+                         f"Name: {entry.get("code")}"),
+            ).add_to(mbb)
+        mbb.add_to(m)
+
+
+    # Roof topology lines (rotated into world coordinates)
+    if matched_data:
+        topo_layer = folium.FeatureGroup(name="Roof Topology Lines")
+        n_lines_total = 0
+        for entry in matched_data:
+            lines_world = entry.get("lines_world", [])
+            osm_id = entry.get("osm_id", "?")
+            print(f"OSM {osm_id}: {len(lines_world)} topology line(s)")
+            for line in lines_world:
+                p0, p1 = line
+                lon0, lat0 = tr.transform(p0[0], p0[1])
+                lon1, lat1 = tr.transform(p1[0], p1[1])
+                print(f"  line latlon: ({lat0:.6f},{lon0:.6f}) → ({lat1:.6f},{lon1:.6f})")
+                folium.PolyLine(
+                    locations=[[lat0, lon0], [lat1, lon1]],
+                    color="#ffffff", weight=2, opacity=0.9,
+                    tooltip=f"OSM {osm_id} — roof line",
+                ).add_to(topo_layer)
+                n_lines_total += 1
+        print(f"Total topology lines drawn: {n_lines_total}")
+        topo_layer.add_to(m)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+    return m._repr_html_()
+
+model = CachedModel()
+
+import pydeck as pdk
+from pyproj import Transformer
+
+# ── coordinate helper ────────────────────────────────────────────────────────
+ 
+_tr_3763_to_4326 = Transformer.from_crs("EPSG:3763", "EPSG:4326", always_xy=True)
+ 
+def _to_lonlat(x, y):
+    lon, lat = _tr_3763_to_4326.transform(x, y)
+    return float(lon), float(lat)
+ 
+ 
+# ── layer builders ────────────────────────────────────────────────────────────
+
+def _make_geojson_layer(geojson_fc) -> pdk.Layer:
+    """
+    OSM building footprints → GeoJsonLayer (extruded, flat-roofed reference).
+    The `geojson_fc` is the FeatureCollection returned by get_osm_buildings_cached().
+    Coordinates are already in EPSG:4326 (lon/lat) as required by deck.gl.
+    """
+    return pdk.Layer(
+        "GeoJsonLayer",
+        geojson_fc,                         # pass the dict directly
+        opacity=0.4,
+        stroked=True,
+        filled=True,
+        extruded=True,
+        wireframe=True,
+        get_elevation=8,                    # flat 8 m placeholder; swap for real height tag:
+                                            # "properties.height" or "properties['building:levels'] * 3"
+        get_fill_color=[100, 180, 255, 120],
+        get_line_color=[255, 255, 255, 200],
+        pickable=True,
+        auto_highlight=True,
+    )
+ 
+ 
+def _make_osm_outline_layer(geojson_fc) -> pdk.Layer:
+    """
+    OSM building footprints → flat PolygonLayer drawn at z=0.
+    This is the 'street outline' — always visible regardless of pitch,
+    because it sits on the ground and is never hidden by the extruded boxes.
+    Coordinates are already in EPSG:4326 as returned by get_osm_buildings_cached().
+    """
+    records = []
+    for feat in geojson_fc.get("features", []):
+        coords = feat["geometry"]["coordinates"][0]   # outer ring, list of [lon, lat]
+        records.append({
+            "polygon": [[lon, lat] for lon, lat in coords],
+            "osm_id":  feat["properties"].get("osm_id", "?"),
+        })
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color=[0, 0, 0, 0],            # fully transparent fill
+        get_line_color=[0, 220, 255, 255],       # bright cyan outline
+        stroked=True,
+        filled=False,
+        extruded=False,
+        line_width_min_pixels=2,
+        pickable=True,
+    )
+ 
+ 
+def _make_bounding_box_layer(matched_data) -> pdk.Layer:
+    """
+    cv2.minAreaRect oriented bounding boxes → PolygonLayer.
+    Each entry in matched_data must have "roof_planes" (the cv2 rotated-rect tuple).
+    """
+    import cv2
+    records = []
+    for entry in matched_data:
+        rect = entry.get("roof_planes")
+        if rect is None:
+            continue
+        corners_3763 = cv2.boxPoints(rect).astype(float)     # (4,2) in EPSG:3763
+        polygon_lonlat = []
+        for x, y in corners_3763:
+            lon, lat = _to_lonlat(x, y)
+            polygon_lonlat.append([lon, lat])
+        polygon_lonlat.append(polygon_lonlat[0])              # close ring
+        records.append({
+            "polygon": polygon_lonlat,
+            "osm_id":  entry.get("osm_id", "?"),
+            "code":    entry.get("code", ""),
+        })
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color=[0, 255, 136, 50],   # translucent green
+        get_line_color=[0, 204, 102, 220],
+        stroked=True,
+        filled=True,
+        extruded=False,
+        line_width_min_pixels=1,
+        pickable=True,
+    )
+ 
+ 
+def _make_roof_face_layer(matched_data) -> pdk.Layer:
+    """
+    PyVista face intersection polygons → PolygonLayer with elevation (3-D).
+ 
+    Each intersection polygon is already a PyVista PolyData whose `.points`
+    are in EPSG:3763 (x, y, z_metres).  We convert x/y to lon/lat and keep z
+    as the elevation so deck.gl renders the sloped faces in true 3-D.
+ 
+    Color scheme:
+        T (top / flat)  → warm orange
+        H (hip)         → warm orange
+        R / L / B       → blue-grey slope faces
+    """
+    _face_colors = {
+        "T": [255, 140,  40, 220],
+        "H": [255, 180,  80, 220],
+        "R": [ 80, 140, 220, 200],
+        "L": [ 80, 140, 220, 200],
+        "B": [ 80, 140, 220, 200],
+    }
+    _default_color = [160, 160, 160, 180]
+ 
+    records = []
+    for entry in matched_data:
+        face_data   = entry.get("face_data", {})
+        intersections = face_data.get("intersections", {}) if face_data else {}
+        osm_id      = entry.get("osm_id", "?")
+        code = entry.get("code", {})
+        for face_name, plane in intersections.items():
+            if plane is None:
+                continue
+            raw_pts = plane.points                     # numpy (N, 3) in EPSG:3763
+            polygon_3d = []
+            for v in raw_pts.tolist():
+                lon, lat = _to_lonlat(v[0], v[1])
+                polygon_3d.append([lon, lat, float(v[2])])  # z kept as metres
+ 
+            records.append({
+                "polygon":   polygon_3d,
+                "elevation": float(raw_pts[:, 2].mean()),   # centroid height for tooltip
+                "face":      face_name,
+                "osm_id":    osm_id,
+                "code" :   code ,
+                "color":     _face_colors.get(face_name, _default_color),
+            })
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color="color",
+        get_elevation=0,        # elevation is baked into the polygon z-coords
+        extruded=False,         # False because z is already in the vertices
+        stroked=True,
+        filled=True,
+        line_width_min_pixels=1,
+        get_line_color=[255, 255, 255, 180],
+        pickable=True,
+        auto_highlight=True,
+    )
+ 
+ 
+def _make_topology_line_layer(matched_data) -> pdk.Layer:
+    """
+    Roof ridge / valley topology lines → PathLayer.
+    Each entry has "lines_world": list of [[x0,y0], [x1,y1]] in EPSG:3763.
+    """
+    records = []
+    for entry in matched_data:
+        osm_id     = entry.get("osm_id", "?")
+        lines_world = entry.get("lines_world", [])
+        for seg in lines_world:
+            p0, p1 = seg
+            lon0, lat0 = _to_lonlat(p0[0], p0[1])
+            lon1, lat1 = _to_lonlat(p1[0], p1[1])
+            records.append({
+                "path":   [[lon0, lat0], [lon1, lat1]],
+                "osm_id": osm_id,
+            })
+ 
+    return pdk.Layer(
+        "PathLayer",
+        records,
+        get_path="path",
+        get_color=[255, 255, 255, 230],
+        get_width=0.3,          # metres
+        width_min_pixels=2,
+        pickable=True,
+    )
+ 
+ 
+# ── view-state helper ─────────────────────────────────────────────────────────
+ 
+def _center_view(matched_data, geojson_fc):
+    """Compute a sensible initial ViewState from the data bounding box."""
+    lons, lats = [], []
+ 
+    # pull coords from matched_data bounding boxes
+    import cv2
+    for entry in matched_data:
+        rect = entry.get("roof_planes")
+        if rect is None:
+            continue
+        for x, y in cv2.boxPoints(rect).astype(float):
+            lon, lat = _to_lonlat(x, y)
+            lons.append(lon); lats.append(lat)
+ 
+    # fallback: use OSM footprint centroids
+    if not lons:
+        for feat in geojson_fc.get("features", []):
+            coords = feat["geometry"]["coordinates"][0]
+            for lon, lat in coords:
+                lons.append(lon); lats.append(lat)
+ 
+    if not lons:
+        return pdk.ViewState(latitude=38.712, longitude=-9.142, zoom=18, pitch=45)
+ 
+    return pdk.ViewState(
+        latitude=sum(lats) / len(lats),
+        longitude=sum(lons) / len(lons),
+        zoom=18,
+        pitch=45,
+        bearing=0,
+        max_zoom=22,
+    )
+ 
+  
+def render_pydeck(
+    geojson_fc,
+    matched_data,
+    out_path="3d_roofs.html",
+    map_style="dark",   # "dark" | "light" | "satellite" | "road"
+):
+    """
+    Build a pydeck Deck with four layers and write it to `out_path`.
+ 
+    Layers (bottom → top):
+        1. GeoJsonLayer   – OSM footprints (extruded reference boxes)
+        2. PolygonLayer   – Oriented min-bounding boxes
+        3. PolygonLayer   – Roof face intersections (PyVista planes)
+        4. PathLayer      – Topology ridge/valley lines
+    """
+    _map_styles = {
+        "dark":  pdk.map_styles.DARK,
+        "light": pdk.map_styles.LIGHT,
+        "road":  pdk.map_styles.ROAD,
+    }
+ 
+    layers = [
+        _make_geojson_layer(geojson_fc),        # 1. extruded 3D reference boxes
+        _make_osm_outline_layer(geojson_fc),    # 2. flat cyan footprint outline (street level)
+        _make_bounding_box_layer(matched_data), # 3. oriented min-bounding boxes
+        _make_roof_face_layer(matched_data),    # 4. roof face intersections (PyVista planes)
+        _make_topology_line_layer(matched_data),# 5. topology ridge/valley lines
+    ]
+ 
+    view_state = _center_view(matched_data, geojson_fc)
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        map_provider="carto",
+        map_style=_map_styles.get(map_style, pdk.map_styles.ROAD),
+        tooltip={
+            "html": (
+                "<b>OSM {osm_id}</b><br/>"
+                "Face: {face} | Code: {code}<br/>"
+                "Elevation: {elevation:.1f} m"
+            ),
+            "style": {"backgroundColor": "rgba(0,0,0,0.7)", "color": "white"},
+        },
+    )
+ 
+    deck.to_html(out_path)
+    print(f"✅  pydeck map saved → {out_path}")
+
+    html_str = deck.to_html(as_string=True)
+    # Escape for srcdoc attribute
+    html_escaped = html_str.replace("&", "&amp;").replace('"', "&quot;")
+    return f'<iframe srcdoc="{html_escaped}" style="width:100%; height:600px; border:none; border-radius:12px;" sandbox="allow-scripts allow-same-origin"></iframe>'
+
+_IFRAME_SRCDOC = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>
+<link rel='stylesheet' href='https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css'/>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body, #map { width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div id='map'></div>
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script src='https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js'></script>
+<script>
+  var map = L.map('map').setView([38.7167, -9.1333], 14);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    maxZoom: 19
+  }).addTo(map);
+
+  var drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  var drawControl = new L.Control.Draw({
+    draw: {
+      rectangle: { shapeOptions: { color:'#3b82f6', weight:2, fillOpacity:0.12 } },
+      polygon: false, circle: false, marker: false,
+      circlemarker: false, polyline: false
+    },
+    edit: { featureGroup: drawnItems }
+  });
+  map.addControl(drawControl);
+
+  function sendBbox(bounds) {
+    window.parent.postMessage({
+      type: 'bbox',
+      data: {
+        north: bounds.getNorth(), south: bounds.getSouth(),
+        east:  bounds.getEast(),  west:  bounds.getWest()
+      }
+    }, '*');
+  }
+
+  map.on(L.Draw.Event.CREATED, function(e) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    sendBbox(e.layer.getBounds());
+  });
+  map.on(L.Draw.Event.EDITED, function(e) {
+    e.layers.eachLayer(function(l) { sendBbox(l.getBounds()); });
+  });
+  map.on(L.Draw.Event.DELETED, function() {
+    window.parent.postMessage({ type: 'bbox', data: null }, '*');
+  });
+</script>
+</body>
+</html>
+""".replace('"', '&quot;').replace("'", "&#39;")  # escape for srcdoc attribute
+
+SELECTION_MAP_HTML = f"""
+<iframe
+  srcdoc="{_IFRAME_SRCDOC}"
+  style="width:100%; height:460px; border:1px solid #1a2540;
+         border-radius:10px; display:block;"
+  sandbox="allow-scripts allow-same-origin"
+  allowfullscreen>
+</iframe>
+"""
+
+# Injected after the full Gradio DOM is ready via demo.load(js=...)
+_BBOX_LISTENER_JS = """
+() => {
+    if (window._bboxListenerAdded) return;
+    window._bboxListenerAdded = true;
+    window.addEventListener('message', function(ev) {
+        if (!ev.data || ev.data.type !== 'bbox') return;
+        var el = document.querySelector('#bbox-bridge textarea');
+        if (!el) return;
+        el.value = ev.data.data ? JSON.stringify(ev.data.data) : '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+}
+"""
+
+_EMPTY_MAP = """
+<div style="
+    height:560px; display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+    background:#060c1a; border-radius:12px;
+    border:1px solid #1a2540; gap:14px;
+">
+  <svg width='52' height='52' viewBox='0 0 24 24' fill='none'
+       stroke='#1e3a5f' stroke-width='1.2' stroke-linecap='round'>
+    <rect x='2' y='2' width='20' height='20' rx='3'/>
+    <path d='M2 9h20M9 21V9'/>
+  </svg>
+  <span style='color:#334155; font-family:monospace; font-size:12px;
+               letter-spacing:0.05em; text-align:center; line-height:1.8;'>
+    ① Draw a rectangle on the map<br>② Set thresholds<br>③ Click Run Detection
+  </span>
+</div>
+"""
+
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+body, .gradio-container { background:#060c1a !important; }
+.gradio-container {
+    max-width:1500px !important;
+    font-family:'JetBrains Mono', monospace !important;
+}
+#hdr { padding:28px 0 18px; border-bottom:1px solid #1a2540; margin-bottom:18px; }
+#hdr h1 { font-size:20px !important; font-weight:700 !important;
+           color:#e2e8f0 !important; letter-spacing:-0.02em; margin:0 !important; }
+#hdr p  { color:#475569 !important; font-size:11px !important;
+           margin:4px 0 0 !important; text-transform:uppercase; letter-spacing:0.08em; }
+#left-panel { background:#0c1525; border:1px solid #1a2540;
+               border-radius:12px; padding:20px; }
+.slabel { color:#475569; font-size:10px; text-transform:uppercase;
+          letter-spacing:0.1em; margin:18px 0 8px;
+          border-top:1px solid #1a2540; padding-top:14px; display:block; }
+#bbox-bridge textarea {
+    background:#060d1e !important; border:1px solid #1e3a5f !important;
+    border-radius:8px !important; color:#38bdf8 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    font-size:11px !important; resize:none !important; }
+input[type=range] { accent-color:#3b82f6 !important; }
+label { color:#94a3b8 !important; font-size:11px !important;
+        text-transform:uppercase; letter-spacing:0.07em; }
+#run-btn {
+    background:linear-gradient(135deg,#2563eb,#1d4ed8) !important;
+    border:none !important; border-radius:8px !important;
+    color:white !important; font-weight:700 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    letter-spacing:0.06em; height:46px !important;
+    box-shadow:0 4px 20px rgba(37,99,235,0.35) !important; }
+#run-btn:hover { background:linear-gradient(135deg,#1d4ed8,#1e40af) !important; }
+#run-btn:disabled { opacity:0.35 !important; }
+#log-box textarea {
+    background:#040a14 !important; border:1px solid #1a2540 !important;
+    border-radius:8px !important; color:#4ade80 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    font-size:11px !important; line-height:1.75 !important; resize:none !important; }
+#map-panel { border-radius:12px; overflow:hidden; }
+#map-panel iframe { border-radius:12px; border:none; }
+"""
+
+def run_pipeline(
+    bbox_json: str,
+    building_threshold: float,
+    overlap_threshold: float,
+    progress=gr.Progress(track_tqdm=False),
+):
+    if not bbox_json or bbox_json.strip() == "":
+        yield "⚠  No area selected — draw a rectangle on the map first.", _EMPTY_MAP
+        return
+    try:
+        bbox  = json.loads(bbox_json)
+        north = bbox["north"]; south = bbox["south"]
+        east  = bbox["east"];  west  = bbox["west"]
+    except Exception:
+        yield "⚠  Could not parse bounding box — please redraw.", _EMPTY_MAP
+        return
+
+    log_lines = []
+    def log(msg):
+        log_lines.append(msg)
+        return "\n".join(log_lines)
+
+    # Stage 1 — CRS
+    progress(0.02, desc="Converting coordinates…")
+    t = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    tl_x, tl_y = t.transform(west, north)
+    br_x, br_y = t.transform(east, south)
+    area_m2 = abs(br_x - tl_x) * abs(tl_y - br_y)
+    yield log(f"📐  Area: {area_m2/1e6:.4f} km²"), _EMPTY_MAP
+    yield log(f"🔁  EPSG:4326 → EPSG:3763 done"), _EMPTY_MAP
+
+
+    # Stage 2 — OSM
+    progress(0.06, desc="Fetching OSM buildings…")
+    yield log("🗺   Querying Overpass API…"), _EMPTY_MAP
+    geojson = get_osm_buildings((tl_x, tl_y), (br_x, br_y))
+    yield log(f"✅  OSM done — {len(geojson['features'])} footprint(s)"), _EMPTY_MAP
+
+    # Stage 3 — WMTS connect
+    progress(0.20, desc="Connecting to WMTS…")
+    yield log("📡  Connecting to DGT WMTS satellite service…"), _EMPTY_MAP
+    wmts_url = ("https://cartografia.dgterritorio.gov.pt/ortos2018/service"
+                "?service=WMTS&request=GetCapabilities")
+    wmts   = WebMapTileService(wmts_url)
+    matrix = wmts.tilematrixsets["PTTM_06"].tilematrix["14"]
+    col_min, col_max, row_min, row_max = get_tile_indices(tl_x, br_y, br_x, tl_y, matrix)
+    total_tiles = (col_max+1-col_min) * (row_max+1-row_min)
+    yield log(f"🛰   Service ready — {total_tiles} tile(s) to download"), _EMPTY_MAP
+
+    # Stage 4 — Tiles
+    def tile_cb(done, total):
+        progress(0.20 + 0.45*(done/total), desc=f"Downloading tiles… {done}/{total}")
+
+    satellite_image, res, _ = retrieve_satelite_image(
+        (tl_x, tl_y), (br_x, br_y), progress_cb=tile_cb)
+    h, w = satellite_image.shape[:2]
+    from PIL import Image
+    Image.fromarray(satellite_image).save("satellite_image.png")
+    yield log(f"✅  Satellite image ready  ({w}×{h} px, {res:.3f} m/px)"), _EMPTY_MAP
+
+
+    # Stage 5 — YOLO
+    progress(0.68, desc="Running YOLO inference…")
+    yield log(f"🤖  Running detector  (conf≥{building_threshold:.2f}, iou≤{overlap_threshold:.2f})…"), _EMPTY_MAP
+    img_bgr   = cv2.cvtColor(satellite_image, cv2.COLOR_RGB2BGR)
+    buildings = retrieve_prediction_list(img_bgr, (tl_x, tl_y), res,
+                                         building_threshold, overlap_threshold, model)
+    total_planes = sum(len(b.planes_in_physical_dimensions) for b in buildings)
+    yield log(f"✅  {len(buildings)} building(s), {total_planes} roof plane(s)"), _EMPTY_MAP
+
+    # here is where we need to assing all rooftop predictions to the OSM buildings
+    yield log(f"🗾 Computing IOU matrix of size [{len(geojson['features'])},{len(buildings)}]"), _EMPTY_MAP
+    iou_mat = compute_iou_matrix(geojson['features'], buildings)
+    yield log(f"✅ Done computing IOU matrix!"), _EMPTY_MAP
+    matched_data = []
+    n_features = len(geojson['features'])
+    for i, osm_feat in enumerate(geojson['features']):
+        print(f"Matching buildings… {i+1}/{n_features}")
+        best_match_idx = np.argmax(iou_mat[i, :])
+        if iou_mat[i, best_match_idx] > 0.3:
+            pred = buildings[best_match_idx]
+            outline,orientedbox,lines_world,code,face_data = topology_converter_mine(pred.raw_roof_data, osm_feat) 
+            matched_data.append({
+                "osm_id": osm_feat["properties"].get("osm_id"),
+                "footprint": outline,
+                "roof_planes": orientedbox,
+                "lines_world": lines_world,
+                "code":code,
+                "face_data":face_data,
+            })
+        if i % 5 == 0 or i == n_features - 1:
+            progress(0.70 + 0.1 * (i / n_features), desc=f"Matching buildings… {i+1}/{n_features}")
+            yield log(f"🏠  Matching {i+1}/{n_features} — {len(matched_data)} matched so far"), _EMPTY_MAP
+    # then we need to generate the 3D view for each building
+
+    print("Rendering map…")
+    print("🗾  Compositing layers…")
+    map_html = build_map_html(geojson, buildings, satellite_image,
+                                (tl_x, tl_y), (br_x, br_y), matched_data=matched_data)
+    with open("building_map.html", "w", encoding="utf-8") as f:
+        f.write(map_html)
+
+    print(f"✅ Map saved successfully to: building_map.html")
+    print("Double-click the file to open it in your browser.")
+
+    # Stage 6 — Render
+    progress(0.88, desc="Rendering map…")
+    yield log("🗾  Compositing layers…"), _EMPTY_MAP
+    map_html = render_pydeck(geojson,matched_data)
+    progress(1.0, desc="Done!")
+    yield log("🎉  All done! Map is live →"), map_html
+
+
+with gr.Blocks(title="Building Topology Detector", css=CSS, theme=gr.themes.Base()) as demo:
+
+    with gr.Column(elem_id="hdr"):
+        gr.HTML("<h1>🛰 Building Topology Detector</h1>")
+        gr.HTML("<p>YOLO · WMTS · OSM · EPSG:3763 — draw a region on the map to begin</p>")
+
+    with gr.Row(equal_height=False):
+
+        with gr.Column(scale=1, min_width=340, elem_id="left-panel"):
+            gr.HTML('<span class="slabel" style="border-top:none;padding-top:0">① Select Region</span>')
+            gr.HTML(SELECTION_MAP_HTML)
+
+            bbox_bridge = gr.Textbox(
+                label="Selected bounding box (WGS84 JSON)",
+                placeholder="Draw a rectangle above to populate…",
+                interactive=True, lines=2, elem_id="bbox-bridge",
+            )
+
+            gr.HTML('<span class="slabel">② Detection Parameters</span>')
+            building_slider = gr.Slider(0.10, 0.95, step=0.05, value=0.50,
+                                        label="Building Confidence Threshold")
+            overlap_slider  = gr.Slider(0.10, 0.95, step=0.05, value=0.50,
+                                        label="Overlap (IoU) Threshold")
+
+            run_btn = gr.Button("▶  Run Detection", variant="primary", elem_id="run-btn")
+
+            gr.HTML('<span class="slabel">③ Progress Log</span>')
+            log_box = gr.Textbox(label="", interactive=False, lines=10, max_lines=10,
+                                 placeholder="Logs will stream here…", elem_id="log-box")
+
+        with gr.Column(scale=3, elem_id="map-panel"):
+            map_display = gr.HTML(value=_EMPTY_MAP)
+
+    run_btn.click(
+        fn=run_pipeline,
+        inputs=[bbox_bridge, building_slider, overlap_slider],
+        outputs=[log_box, map_display],
+    )
+    demo.load(fn=None, js=_BBOX_LISTENER_JS)
+
+demo.launch()

@@ -5,6 +5,7 @@
 - `geometry_main(...) -> tuple` in `geometry_generator.py` - Builds terrain/building geometry and writes `BuildingGeometry` pickles.
 - `main()` in `workflow_comparison.py` - Runs workflow0/workflow1 and snapshots outputs (optional `--include-geometry-pickles`).
 - `main()` in `workflow_geometry_comparison_3d.py` - 3D side-by-side workflow geometry visualiser for one building.
+- `main()` in `workflow1_building_viewer.py` - Interactive workflow1 3D viewer with dropdown building selection.
 - `main()` in `workflow_metrics_report.py` - Generates scenario/building metrics and explicit WF deltas from workflow snapshots.
 - `main(config: Configuration)` in `ucea.py` - Runs geojson.io polygon capture, scenario helpers, workflow comparison, metrics report, and 3D check in one CLI command.
 
@@ -111,6 +112,8 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
   - runs `create-polygon` (`site.shp`)
   - runs helper scripts (`database/zone/terrain/weather/archetypes`) and runs `surroundings-helper` only when `ucea:run-surroundings-helper` is `true`
   - runs `workflow_comparison.py` -> `workflow_metrics_report.py` -> `workflow_geometry_comparison_3d.py`
+  - opens `workflow1_building_viewer.py` to browse all workflow1 building geometries with dropdown selection
+  - supports `ucea:workflow1-only` to skip workflow0 comparison/metrics and run workflow1-only radiation + PV
 
 ## Custom Roof Input Contract
 - File: `inputs/building-geometry/roof_surfaces.geojson`
@@ -126,6 +129,7 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - `main.py` - Radiation entry point.
 - `workflow_comparison.py` - Two-workflow runner and snapshot utility.
 - `workflow_geometry_comparison_3d.py` - Side-by-side 3D geometry comparison.
+- `workflow1_building_viewer.py` - Interactive single-workflow 3D building viewer.
 - `workflow1_geometry_generator_documentation.txt` - Workflow1 reference notes.
 - `workflow_metrics_report.py` - Scenario/building KPI and delta report utility.
 
@@ -139,7 +143,13 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - `workflow_metrics_report.py` supports `--undo-pv-azimuth-harmonisation` to rotate non-flat panel-direction bins by +180° when PV snapshots were produced with temporary azimuth harmonisation.
 - `workflow_metrics_report.py` write step is Windows-lock tolerant: if a CSV target is open, it writes to `<name>.locked_<timestamp>.csv` and continues.
 - `ucea.py` defaults to opening geojson.io URL `https://geojson.io/#map=18.2/38.708267/-9.138085`.
+- `ucea.py` defaults to scenario `C:\Users\Andre\cea-scenarios\test-tilt` when `general:scenario` is empty.
+- `ucea.py` auto-wires INE height enrichment for `zone-helper` and `surroundings-helper` when their `building-height-gpkg` parameters are empty and `cea/resources/radiation/INE_com_NPAV_norm0.gpkg` exists.
 - `ucea.py` writes outputs to `<scenario>/outputs/data/roof-workflow-comparison` unless `ucea:comparison-root` is set.
+- `ucea.py` supports `ucea:workflow1-only = true`:
+  - skips `workflow_comparison.py`, `workflow_metrics_report.py`, and workflow side-by-side 3D figure generation
+  - runs `radiation` + `photovoltaic` directly for workflow1
+  - opens workflow1 viewer from `<scenario>/outputs/data/solar-radiation/radiance_geometry_pickle/zone`
 - `ucea.py` defaults to `ucea:run-surroundings-helper = true`; set it to `false` to preserve manually edited `inputs/geometry/surroundings.shp`.
 - `ucea.py` auto-creates `inputs/building-geometry/roof_surfaces.geojson` with a temporary default payload if the file is missing.
 - The default hardcoded roof in `ucea.py` is intentionally planar (one corrected vertex Z) to avoid OCC null-face assertions in custom roof loading.

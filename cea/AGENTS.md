@@ -125,4 +125,13 @@ def encode(self, value):
 
 - Register new CLI scripts in `scripts.yml` with `interfaces: [cli]` and a module exposing `main(config: Configuration)`.
 - Add a dedicated section in `default.config` for script options (example: `[ucea]`), using unique parameter names to avoid collisions with other sections.
+- Keep default behaviour explicit in `default.config`; for UCEA, `workflow1-only = true` means the default run executes workflow 1 only unless the user sets it to `false`.
 - Regenerate `config.pyi` after config schema changes.
+
+## Height Enrichment Parameters
+
+- `zone-helper:building-height-gpkg` and `zone-helper:ine-fallback-max-distance-m` control optional INE point-height enrichment for `zone-helper`.
+- `surroundings-helper:building-height-gpkg` and `surroundings-helper:ine-fallback-max-distance-m` control the same enrichment for `surroundings-helper`.
+- Current fallback policy is: direct inside-point match first, then 2-nearest average when second-nearest distance is within threshold, then area-median fallback from direct INE matches in the same run.
+- Default `ine-fallback-max-distance-m` is `20` for both zone and surroundings helpers.
+- Keep these parameters nullable so behaviour remains unchanged when no GeoPackage is configured.
