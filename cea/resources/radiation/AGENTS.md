@@ -5,9 +5,10 @@
 - `geometry_main(...) -> tuple` in `geometry_generator.py` - Builds terrain/building geometry and writes `BuildingGeometry` pickles.
 - `main()` in `workflow_comparison.py` - Runs workflow0/workflow1 and snapshots outputs (optional `--include-geometry-pickles`).
 - `main()` in `workflow_geometry_comparison_3d.py` - 3D side-by-side workflow geometry visualiser for one building.
-- `main()` in `workflow1_building_viewer.py` - Interactive workflow1 3D viewer with dropdown building selection.
-- `main()` in `workflow_metrics_report.py` - Generates scenario/building metrics and explicit WF deltas from workflow snapshots.
-- `main(config: Configuration)` in `ucea.py` - Runs geojson.io polygon capture, scenario helpers, workflow comparison, metrics report, and 3D check in one CLI command.
+- `main()` in `workflow1_building_viewer.py` - Interactive workflow1 3D viewer with dropdown building selection, optional roof-sensor overlay, and batch PNG export.
+- `main()` in `workflow_metrics_report.py` - Generates scenario/building metrics (single or dual workflow) and explicit WF deltas when both WF0 and WF1 are selected.
+- `main()` in `solar_capacity_map_3d.py` - Standalone post-CEA visualiser that renders all 3D zone buildings with scalable, clickable solar-capacity bars in one interactive map HTML.
+- `main(config: Configuration)` in `ucea.py` - Runs geojson.io polygon capture, scenario helpers, `ultralytics/fixedboxtilingextension_v3.py` roof export, workflow comparison, metrics report, and 3D check in one CLI command.
 
 ## Key Patterns
 ### DO: Keep `BuildingGeometry` schema stable
@@ -96,7 +97,7 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - Geometry pickles: `outputs/data/solar-radiation/radiance_geometry_pickle`.
 - `daysim.py` reads pickles and writes `<building>_geometry.csv`, `<building>_radiation.csv`, optional feather outputs.
 - `workflow_comparison.py` snapshots per-workflow outputs under `roof-workflow-comparison`.
-- `workflow_metrics_report.py` reads `roof-workflow-comparison` snapshots and writes:
+- `workflow_metrics_report.py` reads workflow roots and writes:
   - `scenario_metrics.csv` / `scenario_deltas.csv`
   - `building_metrics.csv` / `building_deltas.csv`
   - `building_metrics.csv` includes `building_height_m` estimated from workflow `*_geometry.csv` (`max roof Zcoor - min underside Zcoor`; fallback: `max roof Zcoor - terrain_elevation`).
@@ -107,13 +108,18 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
   - Includes both raw and detrended shading spread metrics:
     - raw: `shading_cv_aw`, `shading_p90_p10_Whm2`
     - detrended: `shading_cv_aw_detrended`, `shading_p90_p10_ratio_detrended`
+  - In single-workflow mode (`--workflows WF1`), writes metrics files but skips delta files.
 - `ucea.py` orchestrates:
   - opens geojson.io and captures polygon from clipboard or pasted input
   - runs `create-polygon` (`site.shp`)
   - runs helper scripts (`database/zone/terrain/weather/archetypes`) and runs `surroundings-helper` only when `ucea:run-surroundings-helper` is `true`
-  - runs `workflow_comparison.py` -> `workflow_metrics_report.py` -> `workflow_geometry_comparison_3d.py`
-  - opens `workflow1_building_viewer.py` to browse all workflow1 building geometries with dropdown selection
-  - supports `ucea:workflow1-only` to skip workflow0 comparison/metrics and run workflow1-only radiation + PV
+  - runs `ultralytics/fixedboxtilingextension_v3.py` with:
+    - `--zone-shp-path <scenario>/inputs/building-geometry/zone.shp`
+    - `--output-path <scenario>/inputs/building-geometry/roof_surfaces.geojson`
+    - fixed thresholds (`building=0.15`, `overlap=0.25`)
+  - comparison mode: runs `workflow_comparison.py` -> `workflow_metrics_report.py` -> `workflow_geometry_comparison_3d.py`
+  - workflow1-only mode: runs workflow1 radiation + PV, then runs `workflow_metrics_report.py` in single-workflow mode
+  - opens `workflow1_building_viewer.py` with roof-sensor overlay and exports one image per building
 
 ## Custom Roof Input Contract
 - File: `inputs/building-geometry/roof_surfaces.geojson`
@@ -140,6 +146,7 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - Use `--no-harmonise-pv-azimuth-convention` to disable the temporary harmonisation path.
 - `workflow_comparison.py` cleanup is Windows-lock tolerant: if `comparison-root` cannot be removed because files are open, it retries and then archives the locked folder with `.locked_<timestamp>`.
 - `workflow_metrics_report.py` defaults to `--pv-panels PV1` (override with `--pv-panels`).
+- `workflow_metrics_report.py` defaults to `--workflows WF0,WF1`; use `--workflows WF1 --workflow1-root <path>` for workflow1-only metrics.
 - `workflow_metrics_report.py` supports `--undo-pv-azimuth-harmonisation` to rotate non-flat panel-direction bins by +180° when PV snapshots were produced with temporary azimuth harmonisation.
 - `workflow_metrics_report.py` write step is Windows-lock tolerant: if a CSV target is open, it writes to `<name>.locked_<timestamp>.csv` and continues.
 - `ucea.py` defaults to opening geojson.io URL `https://geojson.io/#map=18.2/38.708267/-9.138085`.
@@ -147,10 +154,30 @@ pd.DataFrame({"Xdir": ..., "Ydir": ..., "Zdir": ..., "TYPE": ...})
 - `ucea.py` auto-wires INE height enrichment for `zone-helper` and `surroundings-helper` when their `building-height-gpkg` parameters are empty and `cea/resources/radiation/INE_com_NPAV_norm0.gpkg` exists.
 - `ucea.py` writes outputs to `<scenario>/outputs/data/roof-workflow-comparison` unless `ucea:comparison-root` is set.
 - `ucea.py` supports `ucea:workflow1-only = true`:
-  - skips `workflow_comparison.py`, `workflow_metrics_report.py`, and workflow side-by-side 3D figure generation
+  - skips `workflow_comparison.py` and workflow side-by-side 3D figure generation
   - runs `radiation` + `photovoltaic` directly for workflow1
+  - runs workflow1-only metrics into `<scenario>/outputs/data/solar-radiation/workflow1_metrics`
+  - exports workflow1 images into `<scenario>/outputs/data/solar-radiation/workflow1_3d_images`
   - opens workflow1 viewer from `<scenario>/outputs/data/solar-radiation/radiance_geometry_pickle/zone`
+- `workflow1_building_viewer.py` supports:
+  - `--export-images-dir` for one-image-per-building PNG export
+  - `--metadata-dir` to load roof sensor coordinates from `<building>_geometry.csv`
+  - `--show-sensors/--no-show-sensors`, `--max-sensors`, and `--no-gui`
+- `solar_capacity_map_3d.py` is intentionally standalone (not in `scripts.yml`) and should be run after `photovoltaic` outputs are available.
+- `solar_capacity_map_3d.py` reads:
+  - `inputs/building-geometry/zone.shp` for building footprints
+  - `outputs/data/solar-radiation/<building>_geometry.csv` for building heights (fallback to zone attributes)
+  - `outputs/data/potentials/solar/PV_<panel>_total_buildings.csv` for per-building solar capacity (`E_PV_gen_kWh`)
+  - `inputs/building-geometry/roof_surfaces.geojson` for custom roof planes (if available and enabled)
+- `solar_capacity_map_3d.py` output:
+  - `<scenario>/outputs/data/solar-radiation/solar_capacity_3d_map.html` (default)
+- `solar_capacity_map_3d.py` custom roof controls:
+  - `--roof-file` to override the default custom roof GeoJSON path
+  - `--show-custom-roofs/--no-show-custom-roofs` to toggle custom roof layer rendering
+  - `--custom-roof-z-offset-m` to keep custom roofs visually above coplanar building tops (reduce z-fighting)
+- `solar_capacity_map_3d.py` passes `--custom-roof-z-offset-m` through the payload builder into custom roof geometry generation (`build_visualisation_payload` -> `build_custom_roofs_payload`).
 - `ucea.py` defaults to `ucea:run-surroundings-helper = true`; set it to `false` to preserve manually edited `inputs/geometry/surroundings.shp`.
+- `ucea.py` always attempts to generate `inputs/building-geometry/roof_surfaces.geojson` via `ultralytics/fixedboxtilingextension_v3.py` immediately after scenario helpers.
 - `ucea.py` auto-creates `inputs/building-geometry/roof_surfaces.geojson` with a temporary default payload if the file is missing.
 - The default hardcoded roof in `ucea.py` is intentionally planar (one corrected vertex Z) to avoid OCC null-face assertions in custom roof loading.
 - `ucea.py` runs `workflow_comparison.py` with `--clean-first` to avoid stale `solar-radiation` / `potentials/solar` artefacts leaking into metrics.

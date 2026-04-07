@@ -81,6 +81,21 @@ def parse_args() -> argparse.Namespace:
         help="Path to outputs/data/roof-workflow-comparison.",
     )
     parser.add_argument(
+        "--workflows",
+        default="WF0,WF1",
+        help="Comma-separated workflow ids to process (WF0, WF1). Default: WF0,WF1.",
+    )
+    parser.add_argument(
+        "--workflow0-root",
+        default="",
+        help="Optional workflow root override for WF0.",
+    )
+    parser.add_argument(
+        "--workflow1-root",
+        default="",
+        help="Optional workflow root override for WF1.",
+    )
+    parser.add_argument(
         "--level",
         default="scenario",
         choices=["scenario", "building", "both"],
@@ -155,6 +170,41 @@ def parse_building_filter(buildings_arg: str) -> set[str] | None:
     if not building_tokens:
         return None
     return set(building_tokens)
+
+
+def parse_workflow_ids(workflows_arg: str) -> list[str]:
+    workflow_ids: list[str] = []
+    for token in workflows_arg.split(","):
+        workflow_id = token.strip().upper()
+        if not workflow_id:
+            continue
+        if workflow_id not in WORKFLOW_FOLDERS:
+            raise ValueError(
+                f"Unsupported workflow id '{workflow_id}' in --workflows. "
+                f"Allowed values: {', '.join(WORKFLOW_IDS)}."
+            )
+        if workflow_id not in workflow_ids:
+            workflow_ids.append(workflow_id)
+    if not workflow_ids:
+        raise ValueError("No valid workflow ids parsed from --workflows.")
+    return workflow_ids
+
+
+def should_write_deltas(workflow_ids: list[str]) -> bool:
+    return "WF0" in workflow_ids and "WF1" in workflow_ids
+
+
+def resolve_workflow_root(
+    workflow_id: str,
+    comparison_root: str,
+    workflow0_root_override: str,
+    workflow1_root_override: str,
+) -> str:
+    if workflow_id == "WF0" and workflow0_root_override.strip():
+        return os.path.abspath(workflow0_root_override.strip())
+    if workflow_id == "WF1" and workflow1_root_override.strip():
+        return os.path.abspath(workflow1_root_override.strip())
+    return os.path.join(comparison_root, WORKFLOW_FOLDERS[workflow_id])
 
 
 def iter_csv_rows(path: str) -> Iterable[list[str]]:
@@ -1096,10 +1146,20 @@ def main() -> None:
     out_dir = os.path.abspath(args.out_dir) if args.out_dir else comparison_root
     panels = normalise_panel_ids(args.pv_panels)
     building_filter = parse_building_filter(args.buildings)
+    selected_workflow_ids = parse_workflow_ids(args.workflows)
+    write_deltas = should_write_deltas(selected_workflow_ids)
 
     workflow_data: dict[str, dict[str, Any]] = {}
-    for workflow_id, folder_name in WORKFLOW_FOLDERS.items():
-        workflow_root = os.path.join(comparison_root, folder_name)
+    workflow_roots: dict[str, str] = {}
+    for workflow_id in selected_workflow_ids:
+        folder_name = WORKFLOW_FOLDERS[workflow_id]
+        workflow_root = resolve_workflow_root(
+            workflow_id=workflow_id,
+            comparison_root=comparison_root,
+            workflow0_root_override=args.workflow0_root,
+            workflow1_root_override=args.workflow1_root,
+        )
+        workflow_roots[workflow_id] = workflow_root
         sensor_stats, raw_sensor_rows = load_sensor_stats(workflow_root)
 
         panel_totals: dict[str, dict[str, dict[str, float]]] = {}
@@ -1150,8 +1210,10 @@ def main() -> None:
                 )
 
     scenario_rows = aggregate_scenario_rows(building_rows)
-    scenario_delta_rows = build_delta_rows(scenario_rows, key_fields=["pv_panel"])
-    building_delta_rows = build_delta_rows(building_rows, key_fields=["pv_panel", "building"])
+    scenario_delta_rows = build_delta_rows(scenario_rows, key_fields=["pv_panel"]) if write_deltas else []
+    building_delta_rows = (
+        build_delta_rows(building_rows, key_fields=["pv_panel", "building"]) if write_deltas else []
+    )
     panel_placement_rows = build_panel_placement_rows(
         workflow_data=workflow_data,
         panels=panels,
@@ -1174,15 +1236,17 @@ def main() -> None:
                 "n_buildings_with_sensor_data",
             ],
         )
-        scenario_delta_fields = build_field_order(
-            scenario_delta_rows,
-            preferred_first=["pv_panel", "wf0_present", "wf1_present", "missing_status"],
-        )
         path_metrics = os.path.join(out_dir, "scenario_metrics.csv")
-        path_deltas = os.path.join(out_dir, "scenario_deltas.csv")
         written_metrics = write_csv(path_metrics, scenario_rows, scenario_metrics_fields)
-        written_deltas = write_csv(path_deltas, scenario_delta_rows, scenario_delta_fields)
-        outputs_written.extend([written_metrics, written_deltas])
+        outputs_written.append(written_metrics)
+        if write_deltas:
+            scenario_delta_fields = build_field_order(
+                scenario_delta_rows,
+                preferred_first=["pv_panel", "wf0_present", "wf1_present", "missing_status"],
+            )
+            path_deltas = os.path.join(out_dir, "scenario_deltas.csv")
+            written_deltas = write_csv(path_deltas, scenario_delta_rows, scenario_delta_fields)
+            outputs_written.append(written_deltas)
 
     if args.level in ("building", "both"):
         building_metrics_fields = build_field_order(
@@ -1198,15 +1262,17 @@ def main() -> None:
                 "missing_status",
             ],
         )
-        building_delta_fields = build_field_order(
-            building_delta_rows,
-            preferred_first=["pv_panel", "building", "wf0_present", "wf1_present", "missing_status"],
-        )
         path_metrics = os.path.join(out_dir, "building_metrics.csv")
-        path_deltas = os.path.join(out_dir, "building_deltas.csv")
         written_metrics = write_csv(path_metrics, building_rows, building_metrics_fields)
-        written_deltas = write_csv(path_deltas, building_delta_rows, building_delta_fields)
-        outputs_written.extend([written_metrics, written_deltas])
+        outputs_written.append(written_metrics)
+        if write_deltas:
+            building_delta_fields = build_field_order(
+                building_delta_rows,
+                preferred_first=["pv_panel", "building", "wf0_present", "wf1_present", "missing_status"],
+            )
+            path_deltas = os.path.join(out_dir, "building_deltas.csv")
+            written_deltas = write_csv(path_deltas, building_delta_rows, building_delta_fields)
+            outputs_written.append(written_deltas)
 
     if args.level in ("building", "both"):
         panel_placement_fields = [
@@ -1232,6 +1298,11 @@ def main() -> None:
     print("Workflow metrics report completed.")
     print(f"comparison_root: {comparison_root}")
     print(f"level: {args.level}")
+    print(f"workflows: {', '.join(selected_workflow_ids)}")
+    if args.workflow0_root.strip():
+        print(f"workflow0_root: {workflow_roots.get('WF0', os.path.abspath(args.workflow0_root.strip()))}")
+    if args.workflow1_root.strip():
+        print(f"workflow1_root: {workflow_roots.get('WF1', os.path.abspath(args.workflow1_root.strip()))}")
     print(f"pv_panels: {', '.join(panels)}")
     if building_filter is not None:
         print(f"building_filter: {', '.join(sorted(building_filter))}")

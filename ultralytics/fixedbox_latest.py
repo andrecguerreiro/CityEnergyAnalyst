@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 from ultralytics import YOLO
 from owslib.wmts import WebMapTileService
 from PIL import Image
@@ -12,6 +12,9 @@ import json
 import gradio as gr
 import os
 import hashlib
+import sys
+
+ZONE_SHP_PATH = r"C:\Users\Andre\cea-scenarios\test-tilt\scenario\inputs\building-geometry\zone.shp"
 
 ## Listing of logic in the project
 '''
@@ -175,7 +178,157 @@ class EstimatedBuilding:
                 normal=normal, inclination=float(inc), orientation=float(ori),
             ))
 
-def retrieve_prediction_list(satellite_image, top_left_corner, res,
+def _iter_tiles(image, top_left_corner, res, tile_px, overlap=0.2):
+    """
+    Yield (tile_img, tile_top_left_corner) for every window position.
+ 
+    Parameters
+    ----------
+    image           : np.ndarray  full satellite image (H, W, 3)
+    top_left_corner : (x, y)      EPSG:3763 coords of the image top-left pixel
+    res             : float        metres per pixel
+    tile_px         : int          tile side in pixels (match your model input, e.g. 640)
+    overlap         : float        fractional overlap between adjacent tiles (0.0â€“0.5)
+    """
+    img_h, img_w = image.shape[:2]
+    stride = int(tile_px * (1.0 - overlap))   # pixels between tile starts
+    tl_x, tl_y = top_left_corner
+ 
+    row_start = 0
+    while True:
+        row_end = row_start + tile_px
+        # Clamp so we never go out of bounds; shift start back instead
+        if row_end > img_h:
+            row_start = max(0, img_h - tile_px)
+            row_end   = img_h
+ 
+        col_start = 0
+        while True:
+            col_end = col_start + tile_px
+            if col_end > img_w:
+                col_start = max(0, img_w - tile_px)
+                col_end   = img_w
+ 
+            tile_img = image[row_start:row_end, col_start:col_end]
+ 
+            # EPSG:3763 top-left of THIS tile
+            tile_tl_x = tl_x + col_start * res
+            tile_tl_y = tl_y - row_start * res   # y decreases downward
+ 
+            yield tile_img, (tile_tl_x, tile_tl_y)
+ 
+            if col_end == img_w:
+                break
+            col_start += stride
+ 
+        if row_end == img_h:
+            break
+        row_start += stride
+ 
+ 
+# â”€â”€ 2. Per-box IoU in EPSG:3763 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ 
+def _box_iou(box_a, box_b):
+    """
+    box = [xmin, ymin, xmax, ymax] in EPSG:3763 metres.
+    Returns IoU scalar.
+    """
+    # axis-aligned box IoU: overlap area / union area
+    ix = max(0.0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    iy = max(0.0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+    inter = ix * iy
+    area_a = (box_a[2]-box_a[0]) * (box_a[3]-box_a[1])
+    area_b = (box_b[2]-box_b[0]) * (box_b[3]-box_b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+ 
+ 
+# â”€â”€ 3. Global NMS over EstimatedBuilding list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ 
+def _nms_predictions(predictions, iou_threshold=0.5):
+    """
+    Greedy NMS over all EstimatedBuilding objects using box_coords_in_epsg_3763.
+    Buildings are sorted by the max roof-plane probability (proxy for confidence).
+    Returns a filtered list with duplicates removed.
+    """
+    if not predictions:
+        return []
+ 
+    # Sort descending by best roof-face probability as a confidence proxy
+    def _score(b):
+        if len(b.planes_in_physical_dimensions) == 0:
+            return 0.0
+        return max(p.probability for p in b.planes_in_physical_dimensions)
+ 
+    ranked = sorted(predictions, key=_score, reverse=True)
+    kept   = []
+ 
+    for candidate in ranked:
+        box_c = candidate.box_coords_in_epsg_3763
+        suppressed = False
+        for accepted in kept:
+            box_a = accepted.box_coords_in_epsg_3763
+            if _box_iou(box_c, box_a) > iou_threshold:
+                suppressed = True
+                break
+        if not suppressed:
+            kept.append(candidate)
+ 
+    return kept
+  
+def retrieve_prediction_list(
+    satellite_image,
+    top_left_corner,
+    res,
+    building_threshold,
+    overlap_threshold,
+    cached_model,
+    tile_overlap=0.2,
+    nms_iou=0.5,
+):
+    """
+    Tiled inference replacement.
+ 
+    Extra parameters vs. original
+    ------------------------------
+    tile_px      : model input size in pixels (default 640)
+    tile_overlap : fractional overlap between adjacent tiles (default 0.2 = 20 %)
+    nms_iou      : IoU threshold for cross-tile duplicate suppression (default 0.5)
+    """
+    img_h, img_w = satellite_image.shape[:2]
+    all_predictions = []
+    tile_idx = 0
+ 
+    for tile_img, tile_tl in _iter_tiles(
+        satellite_image, top_left_corner, res, cached_model.model.model.args.get('imgsz', 640), tile_overlap
+    ):
+        tile_idx += 1
+        print(f"  ðŸ”² Tile {tile_idx} â€” tl=({tile_tl[0]:.0f}, {tile_tl[1]:.0f}), "
+              f"size={tile_img.shape[1]}Ã—{tile_img.shape[0]}")
+ 
+        results = cached_model.model(
+            tile_img,
+            conf=building_threshold,
+            iou=overlap_threshold,   # within-tile NMS, same as before
+        )[0]
+ 
+        for i in range(results.boxes.shape[0]):
+            b = EstimatedBuilding()
+            b.convert_tensor_prediction_to_building(
+                boxes_xywhn=np.array(results.boxes[i].xywhn[0]),
+                roof_prediction=np.array(sigmoid(results.roof.data[i, :])),
+                top_left_corner=tile_tl,
+                res=res,
+                image_shape=tile_img.shape,
+            )
+            all_predictions.append(b)
+ 
+    print(f"  ðŸ“¦ {len(all_predictions)} raw detections across {tile_idx} tile(s)")
+    final = _nms_predictions(all_predictions, iou_threshold=nms_iou)
+    print(f"  âœ… {len(final)} after global NMS (iouâ‰¥{nms_iou})")
+    return final
+
+def non_retrieve_prediction_list(satellite_image, top_left_corner, res,
                               building_threshold, overlap_threshold, cached_model):
     results = cached_model.model(satellite_image, conf=building_threshold,
                                   iou=overlap_threshold)[0]
@@ -222,7 +375,7 @@ def get_osm_buildings_cached(top_left, bottom_right):
     cache_path = f"cache/osm/{cache_key}.json"
 
     if os.path.exists(cache_path):
-        print(f"📦 Loading OSM data from cache: {cache_path}")
+        print(f"ðŸ“¦ Loading OSM data from cache: {cache_path}")
         with open(cache_path, "r") as f:
             return json.load(f)
 
@@ -232,6 +385,96 @@ def get_osm_buildings_cached(top_left, bottom_right):
     with open(cache_path, "w") as f:
         json.dump(data, f)
     return data
+
+
+def build_cea_ordered_buildings_geojson(polygon_ring_lon_lat):
+    """
+    Load authoritative CEA building footprints from scenario `zone.shp`,
+    filter by polygon intersection, and expose `properties.cea_name`
+    from zone `name` values without any renaming.
+    """
+    if len(polygon_ring_lon_lat) < 4:
+        raise ValueError("Polygon must include at least 4 points (closed ring).")
+
+    ring = [[float(lon), float(lat)] for lon, lat in polygon_ring_lon_lat]
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+
+    try:
+        import geopandas as gpd
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "GeoPandas is required to read scenario zone.shp footprints."
+        ) from exc
+
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    if not os.path.exists(ZONE_SHP_PATH):
+        raise FileNotFoundError(f"Scenario zone.shp not found: {ZONE_SHP_PATH}")
+
+    zone_df = gpd.read_file(ZONE_SHP_PATH)
+    if "name" not in zone_df.columns:
+        raise ValueError("Scenario zone.shp is missing required `name` column.")
+    if zone_df.crs is None:
+        raise ValueError("Scenario zone.shp has no CRS; cannot transform to EPSG:4326.")
+
+    zone_df = zone_df.to_crs("EPSG:4326")
+    zone_df = zone_df[
+        zone_df.geometry.notnull()
+        & (~zone_df.geometry.is_empty)
+        & zone_df.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    ].copy()
+
+    selected_polygon = ShapelyPolygon(ring)
+    zone_df = zone_df[zone_df.intersects(selected_polygon)].copy()
+
+    # Keep one geometry per CEA building identifier to avoid duplicate IDs.
+    zone_df["name"] = zone_df["name"].astype(str).str.strip()
+    zone_df = zone_df[(zone_df["name"] != "") & (zone_df["name"].str.lower() != "nan")].copy()
+    zone_df = zone_df.dissolve(by="name", as_index=False)
+    zone_df = zone_df.sort_values("name").reset_index(drop=True)
+
+    features = []
+    for _, row in zone_df.iterrows():
+        cea_name = str(row.get("name", "")).strip()
+
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        # Matching/topology expects a single polygon footprint per building.
+        if geom.geom_type == "MultiPolygon":
+            polygon = max(list(geom.geoms), key=lambda g: g.area)
+        elif geom.geom_type == "Polygon":
+            polygon = geom
+        else:
+            continue
+
+        if "building" in zone_df.columns:
+            building_type = str(row.get("building", ""))
+        elif "use_type1" in zone_df.columns:
+            building_type = str(row.get("use_type1", ""))
+        else:
+            building_type = ""
+
+        coords = [[float(x), float(y)] for x, y, *_ in polygon.exterior.coords]
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {"cea_name": cea_name, "building": building_type},
+                "geometry": {"type": "Polygon", "coordinates": [coords]},
+            }
+        )
+
+    if not features:
+        raise ValueError(
+            "No zone.shp buildings intersect the selected polygon."
+        )
+
+    first_five = [f["properties"]["cea_name"] for f in features[:5]]
+    print(f"[info] zone.shp buildings selected: {len(features)}; first IDs: {first_five}")
+
+    return {"type": "FeatureCollection", "features": features}
 
 import numpy as np
 import math
@@ -259,6 +502,8 @@ def planenormal(face_id, inc, ori,axis_aligned_bounding_box_rotation):
     # inc 0-1 -> 0-90 degrees
     tilt = inc * (math.pi / 2)
     # ori 0-1 -> -45 to +45 degrees relative to base_ori
+    # TODO emergency - remove this--- just for testing
+    # ori = 0.5
     global_azimuth = (ori - 0.5) * (math.pi / 2) + base_ori_rad
     azimuth = global_azimuth + axis_aligned_bounding_box_rotation
     nz = math.cos(tilt)
@@ -392,7 +637,7 @@ def topology_converter_mine(roof_prediction, osm_building):
     points = outline[:2, :].T.astype(np.float32)
     rect = cv2.minAreaRect(points)
     center, (width, height), angle = rect
-    print(f"Code angle: {angle}°")
+    print(f"Code angle: {angle}Â°")
  
     x_min_l = -width / 2.0
     x_max_l = width / 2.0
@@ -928,30 +1173,149 @@ def topology_converter_mine(roof_prediction, osm_building):
 from pyproj import Transformer
 import numpy as np
 
-def compute_area_overlap(osm_building, prediction_building) -> float:
-    tr = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
-
-    xs, ys = zip(*[tr.transform(lon, lat)
-                   for lon, lat in osm_building["geometry"]["coordinates"][0]])
-    osm_box = [min(xs), min(ys), max(xs), max(ys)]
-    pred_box = prediction_building.box_coords_in_epsg_3763
-
-    ix0, iy0 = max(osm_box[0], pred_box[0]), max(osm_box[1], pred_box[1])
-    ix1, iy1 = min(osm_box[2], pred_box[2]), min(osm_box[3], pred_box[3])
-    inter_area = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-
-    area_osm  = (osm_box[2]  - osm_box[0])  * (osm_box[3]  - osm_box[1])
-    area_pred = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
-    union_area = area_osm + area_pred - inter_area
-
-    return inter_area / union_area if union_area > 0 else 0.0
-
 def compute_iou_matrix(osm_buildings, predictions):
-    iou_matrix = np.zeros((len(osm_buildings), len(predictions)))
-    for i in range(len(osm_buildings)):
-        for j in range(len(predictions)):
-            iou_matrix[i, j] = compute_area_overlap(osm_buildings[i], predictions[j])
-    return iou_matrix
+    osm_boxes = []
+    _TR_4326_TO_3763 = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    for feat in osm_buildings:
+        xs, ys = zip(*[_TR_4326_TO_3763.transform(lon, lat)
+                    for lon, lat in feat["geometry"]["coordinates"][0]])
+        osm_boxes.append([min(xs), min(ys), max(xs), max(ys)])
+
+    iou_mat = np.zeros((len(osm_boxes), len(predictions)))
+    for i, osm_box in enumerate(osm_boxes):
+        for j, pred in enumerate(predictions):
+            pred_box = pred.box_coords_in_epsg_3763
+            ix0 = max(osm_box[0], pred_box[0])
+            iy0 = max(osm_box[1], pred_box[1])
+            ix1 = min(osm_box[2], pred_box[2])
+            iy1 = min(osm_box[3], pred_box[3])
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            area_osm  = (osm_box[2] - osm_box[0]) * (osm_box[3] - osm_box[1])
+            area_pred = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
+            union = area_osm + area_pred - inter
+            iou_mat[i, j] = inter / union if union > 0 else 0.0
+    return iou_mat
+
+
+def _feature_building_id(feature, fallback="?"):
+    props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+    return str(props.get("cea_name") or props.get("osm_id") or fallback)
+
+
+def _entry_building_id(entry, fallback="?"):
+    return str(
+        entry.get("building_id")
+        or entry.get("cea_name")
+        or entry.get("osm_id")
+        or fallback
+    )
+
+
+def export_roof_surfaces_geojson(
+    matched_data,
+    output_path="roof.geojson",
+    source_crs="EPSG:3763",
+    target_crs="EPSG:32629",
+):
+    """
+    Export roof surfaces from face intersections to GeoJSON.
+    One feature is written per (building, face) surface.
+    """
+    tr = Transformer.from_crs(source_crs, target_crs, always_xy=True)
+    features = []
+
+    def ordered_ring_from_points(points_3d):
+        if points_3d.shape[0] < 3:
+            return None
+
+        pts = np.unique(np.round(points_3d, 6), axis=0)
+        if pts.shape[0] < 3:
+            return None
+
+        centroid = np.mean(pts, axis=0)
+        centered = pts - centroid
+
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        axis_u = vh[0]
+        normal = vh[2]
+        axis_v = np.cross(normal, axis_u)
+
+        norm_u = np.linalg.norm(axis_u)
+        norm_v = np.linalg.norm(axis_v)
+        if norm_u == 0.0 or norm_v == 0.0:
+            return None
+        axis_u = axis_u / norm_u
+        axis_v = axis_v / norm_v
+
+        uv = np.column_stack(
+            [
+                np.dot(centered, axis_u),
+                np.dot(centered, axis_v),
+            ]
+        )
+        angles = np.arctan2(uv[:, 1], uv[:, 0])
+        order = np.argsort(angles)
+        ordered = pts[order]
+
+        if ordered.shape[0] < 3:
+            return None
+
+        ring = ordered.tolist()
+        ring.append(ordered[0].tolist())
+        return ring
+
+    for entry in matched_data:
+        building_id = _entry_building_id(entry, fallback="unknown")
+        intersections = entry.get("face_data", {}).get("intersections", {})
+        roof_counter = 1
+
+        for _, tile_mesh in intersections.items():
+            if tile_mesh is None or tile_mesh.n_points < 3:
+                continue
+
+            points = np.asarray(tile_mesh.points)
+            if points.ndim != 2 or points.shape[1] < 3:
+                continue
+
+            ring_3d_src = ordered_ring_from_points(points)
+            if ring_3d_src is None or len(ring_3d_src) < 4:
+                continue
+
+            ring_3d_dst = []
+            for x, y, z in ring_3d_src:
+                x_t, y_t = tr.transform(float(x), float(y))
+                ring_3d_dst.append([x_t, y_t, float(z)])
+
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "building": building_id,
+                        "roof_id": str(roof_counter),
+                    },
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [ring_3d_dst],
+                    },
+                }
+            )
+            roof_counter += 1
+
+    geojson = {
+        "type": "FeatureCollection",
+        "name": "roof",
+        "crs": {
+            "type": "name",
+            "properties": {"name": f"urn:ogc:def:crs:{target_crs.replace(':', '::')}"},
+        },
+        "features": features,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(geojson, f, ensure_ascii=False, indent=2)
+
+    print(f"[ok] Roof surfaces exported to: {output_path} ({len(features)} feature(s))")
+    return geojson
 
 def build_map_html(osm_geojson, predicted_buildings, satellite_image,
                    top_left_corner, bottom_right_corner, matched_data=None):
@@ -980,12 +1344,17 @@ def build_map_html(osm_geojson, predicted_buildings, satellite_image,
         interactive=False, cross_origin=False).add_to(sat)
     sat.add_to(m)
 
-    osm = folium.FeatureGroup(name="OSM Buildings")
+    has_cea_names = any(
+        "cea_name" in f.get("properties", {}) for f in osm_geojson.get("features", [])
+    )
+    osm = folium.FeatureGroup(name="Zone Buildings" if has_cea_names else "OSM Buildings")
+    tooltip_fields = ["cea_name", "building"] if has_cea_names else ["osm_id", "building"]
+    tooltip_aliases = ["CEA ID", "Type"] if has_cea_names else ["OSM ID", "Type"]
     folium.GeoJson(osm_geojson,
         style_function=lambda _: {"fillColor":"#3388ff","color":"#1a55cc",
                                    "weight":2,"fillOpacity":0.3},
-        tooltip=folium.GeoJsonTooltip(fields=["osm_id","building"],
-                                       aliases=["OSM ID","Type"], localize=True)
+        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields,
+                                       aliases=tooltip_aliases, localize=True)
     ).add_to(osm)
     osm.add_to(m)
 
@@ -995,7 +1364,7 @@ def build_map_html(osm_geojson, predicted_buildings, satellite_image,
         n_planes = len(building.planes_in_physical_dimensions)
         folium.Polygon(locations=box_poly(building.box_coords_in_epsg_3763),
             color="#cc0000", fill_color="#ff4444", fill_opacity=0.3, weight=2,
-            tooltip=f"Building {i} — {n_planes} roof plane(s)").add_to(pred)
+            tooltip=f"Building {i} â€” {n_planes} roof plane(s)").add_to(pred)
         for plane in building.planes_in_physical_dimensions:
             cx = sum(p[0] for p in plane.corners)/4
             cy = sum(p[1] for p in plane.corners)/4
@@ -1022,16 +1391,18 @@ def build_map_html(osm_geojson, predicted_buildings, satellite_image,
                 lon, lat = tr.transform(x, y)
                 corners_latlon.append([lat, lon])
             corners_latlon.append(corners_latlon[0])  # close polygon
-            osm_id = entry.get("osm_id", "?")
+            building_id = _entry_building_id(entry)
             _, (w_rect, h_rect), angle = oriented_rect
             folium.Polygon(
                 locations=corners_latlon,
                 color="#00cc66", fill_color="#00ff88", fill_opacity=0.25, weight=2,
                 dash_array="6",
-                tooltip=(f"OSM {osm_id} — Min Bounding Box<br>"
-                         f"W: {w_rect:.1f} m  H: {h_rect:.1f} m<br>"
-                         f"Angle: {angle:.1f}°"
-                         f"Name: {entry.get('code')}"),
+                tooltip=(
+                    f"Building {building_id} - Min Bounding Box<br>"
+                    f"W: {w_rect:.1f} m  H: {h_rect:.1f} m<br>"
+                    f"Angle: {angle:.1f} deg<br>"
+                    f"Code: {entry.get('code')}"
+                ),
             ).add_to(mbb)
         mbb.add_to(m)
 
@@ -1042,17 +1413,17 @@ def build_map_html(osm_geojson, predicted_buildings, satellite_image,
         n_lines_total = 0
         for entry in matched_data:
             lines_world = entry.get("lines_world", [])
-            osm_id = entry.get("osm_id", "?")
-            print(f"OSM {osm_id}: {len(lines_world)} topology line(s)")
+            building_id = _entry_building_id(entry)
+            print(f"Building {building_id}: {len(lines_world)} topology line(s)")
             for line in lines_world:
                 p0, p1 = line
                 lon0, lat0 = tr.transform(p0[0], p0[1])
                 lon1, lat1 = tr.transform(p1[0], p1[1])
-                print(f"  line latlon: ({lat0:.6f},{lon0:.6f}) → ({lat1:.6f},{lon1:.6f})")
+                print(f"  line latlon: ({lat0:.6f},{lon0:.6f}) -> ({lat1:.6f},{lon1:.6f})")
                 folium.PolyLine(
                     locations=[[lat0, lon0], [lat1, lon1]],
                     color="#ffffff", weight=2, opacity=0.9,
-                    tooltip=f"OSM {osm_id} — roof line",
+                    tooltip=f"Building {building_id} - roof line",
                 ).add_to(topo_layer)
                 n_lines_total += 1
         print(f"Total topology lines drawn: {n_lines_total}")
@@ -1062,207 +1433,768 @@ def build_map_html(osm_geojson, predicted_buildings, satellite_image,
     return m._repr_html_()
 
 model = CachedModel()
-jsonbox = "{\"north\":38.71287282568031,\"south\":38.71177693488299,\"east\":-9.141268730163576,\"west\":-9.142599105834963}"
 
-bbox  = json.loads(jsonbox)
-north = bbox["north"]; south = bbox["south"]
-east  = bbox["east"];  west  = bbox["west"]
+import pydeck as pdk
+from pyproj import Transformer
 
-print("Converting coordinates…")
-t = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
-tl_x, tl_y = t.transform(west, north)
-br_x, br_y = t.transform(east, south)
-area_m2 = abs(br_x - tl_x) * abs(tl_y - br_y)
-print(f"📐  Area: {area_m2/1e6:.4f} km²")
-print(f"🔁  EPSG:4326 → EPSG:3763 done")
-
-print("Connecting to WMTS…")
-print("📡  Connecting to DGT WMTS satellite service…")
-wmts_url = ("https://cartografia.dgterritorio.gov.pt/ortos2018/service"
-            "?service=WMTS&request=GetCapabilities")
-wmts   = WebMapTileService(wmts_url)
-matrix = wmts.tilematrixsets["PTTM_06"].tilematrix["14"]
-col_min, col_max, row_min, row_max = get_tile_indices(tl_x, br_y, br_x, tl_y, matrix)
-total_tiles = (col_max+1-col_min) * (row_max+1-row_min)
-print(f"🛰   Service ready — {total_tiles} tile(s) to download")
-
-def tile_cb(done, total):
-    print(f"Downloading tiles… {done}/{total}")
-
-satellite_image, res, _ = retrieve_satelite_image(
-    (tl_x, tl_y), (br_x, br_y), progress_cb=tile_cb)
-h, w = satellite_image.shape[:2]
-print(f"✅  Satellite image ready  ({w}×{h} px, {res:.3f} m/px)")
-
-print("Fetching OSM buildings…")
-print("🗺   Querying Overpass API…")
-geojson = get_osm_buildings_cached((tl_x, tl_y), (br_x, br_y))
-print(f"✅  OSM done — {len(geojson['features'])} footprint(s)")
-
-
-building_threshold = 0.1
-overlap_threshold = 0.3
-print("Running YOLO inference…")
-print(f"🤖  Running detector  (conf≥{building_threshold:.2f}, iou≤{overlap_threshold:.2f})…")
-img_bgr   = cv2.cvtColor(satellite_image, cv2.COLOR_RGB2BGR)
-buildings = retrieve_prediction_list(img_bgr, (tl_x, tl_y), res,
-                                        building_threshold, overlap_threshold, model)
-total_planes = sum(len(b.planes_in_physical_dimensions) for b in buildings)
-print(f"✅  {len(buildings)} building(s), {total_planes} roof plane(s)")
-
-# here is where we need to assing all rooftop predictions to the OSM buildings
-iou_mat = compute_iou_matrix(geojson['features'], buildings)
-matched_data = []
+# â”€â”€ coordinate helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  
-for i, osm_feat in enumerate(geojson['features']):
-    best_match_idx = np.argmax(iou_mat[i, :])
-    if iou_mat[i, best_match_idx] > 0.3:
-        pred = buildings[best_match_idx]
-        outline_coordinates = []
-        outline,orientedbox,lines_world,code,face_data = topology_converter_mine(pred.raw_roof_data, osm_feat) 
-        matched_data.append({
-            "osm_id": osm_feat["properties"].get("osm_id"),
-            "footprint": outline,
-            "roof_planes": orientedbox,
-            "lines_world": lines_world,
-            "code":code,
-            "face_data":face_data,
+_tr_3763_to_4326 = Transformer.from_crs("EPSG:3763", "EPSG:4326", always_xy=True)
+ 
+def _to_lonlat(x, y):
+    lon, lat = _tr_3763_to_4326.transform(x, y)
+    return float(lon), float(lat)
+ 
+ 
+# â”€â”€ layer builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _make_geojson_layer(geojson_fc) -> pdk.Layer:
+    """
+    OSM building footprints â†’ GeoJsonLayer (extruded, flat-roofed reference).
+    The `geojson_fc` is the FeatureCollection returned by get_osm_buildings_cached().
+    Coordinates are already in EPSG:4326 (lon/lat) as required by deck.gl.
+    """
+    return pdk.Layer(
+        "GeoJsonLayer",
+        geojson_fc,                         # pass the dict directly
+        opacity=0.4,
+        stroked=True,
+        filled=True,
+        extruded=True,
+        wireframe=True,
+        get_elevation=8,                    # flat 8 m placeholder; swap for real height tag:
+                                            # "properties.height" or "properties['building:levels'] * 3"
+        get_fill_color=[100, 180, 255, 120],
+        get_line_color=[255, 255, 255, 200],
+        pickable=True,
+        auto_highlight=True,
+    )
+ 
+ 
+def _make_osm_outline_layer(geojson_fc) -> pdk.Layer:
+    """
+    OSM building footprints â†’ flat PolygonLayer drawn at z=0.
+    This is the 'street outline' â€” always visible regardless of pitch,
+    because it sits on the ground and is never hidden by the extruded boxes.
+    Coordinates are already in EPSG:4326 as returned by get_osm_buildings_cached().
+    """
+    records = []
+    for feat in geojson_fc.get("features", []):
+        coords = feat["geometry"]["coordinates"][0]   # outer ring, list of [lon, lat]
+        records.append({
+            "polygon": [[lon, lat] for lon, lat in coords],
+            "building_id": _feature_building_id(feat),
         })
-
-
-# then we need to generate the 3D view for each building
-
-# Stage 6 — Render
-print("Rendering map…")
-print("🗾  Compositing layers…")
-map_html = build_map_html(geojson, buildings, satellite_image,
-                            (tl_x, tl_y), (br_x, br_y), matched_data=matched_data)
-with open("building_map.html", "w", encoding="utf-8") as f:
-    f.write(map_html)
-
-print(f"✅ Map saved successfully to: building_map.html")
-print("Double-click the file to open it in your browser.")
-
-print("Converting rooftops to real planes…")
-
-
-import pyvista as pv
-import numpy as np
-import math
-def render_3d_tiles_old(matched_data, base_height=10.0, max_roof_extension=20.0):
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color=[0, 0, 0, 0],            # fully transparent fill
+        get_line_color=[0, 220, 255, 255],       # bright cyan outline
+        stroked=True,
+        filled=False,
+        extruded=False,
+        line_width_min_pixels=2,
+        pickable=True,
+    )
+ 
+ 
+def _make_bounding_box_layer(matched_data) -> pdk.Layer:
     """
-    Renders buildings by taking a solid cuboid and 'carving' it with 
-    intersecting roof planes based on the model predictions.
+    cv2.minAreaRect oriented bounding boxes â†’ PolygonLayer.
+    Each entry in matched_data must have "roof_planes" (the cv2 rotated-rect tuple).
     """
-    pl = pv.Plotter(window_size=[1400, 900])
-    pl.set_background("white")
-
+    import cv2
+    records = []
     for entry in matched_data:
-        # 1. Get the oriented bounding box details from the matched data
-        # 'roof_planes' in your matched_data is the 'rect' from cv2.minAreaRect
-        oriented_rect = entry.get("roof_planes") 
-        if oriented_rect is None:
+        rect = entry.get("roof_planes")
+        if rect is None:
             continue
-            
-        center, (width, height), angle = oriented_rect
-        face_data = entry.get("face_data", {})
-        osm_id = entry.get("osm_id", "Unknown")
-
-        # 2. Create the initial solid Cuboid in LOCAL coordinates
-        # We start with a block taller than the building to allow for clipping
-        z_min = 0.0
-        z_max = base_height + max_roof_extension
-        local_box = pv.Box(bounds=[-width/2, width/2, -height/2, height/2, z_min, z_max])
-
-        # 3. Define the cutting planes for each face (T, R, B, L)
-        # Normal points 'up and out'. Clipping removes geometry in the direction of the normal.
-        face_configs = {
-            "T": {"origin": [0,  height/2, base_height], "normal_2d": [0,  1]}, # Top (+y)
-            "B": {"origin": [0, -height/2, base_height], "normal_2d": [0, -1]}, # Bottom (-y)
-            "R": {"origin": [ width/2, 0, base_height], "normal_2d": [ 1,  0]}, # Right (+x)
-            "L": {"origin": [-width/2, 0, base_height], "normal_2d": [-1,  0]}, # Left (-x)
-        }
-
-        fused_mesh = local_box
-        sloped_active = False
-
-        for side, config in face_configs.items():
-            data = face_data.get(side, {})
-            if data.get("active"):
-                sloped_active = True
-                # Inclination is 0-1 (mapped to 0 to ~90 degrees)
-                # We cap at 85 degrees to prevent infinite planes/errors
-                alpha = min(data.get("inclination", 0.0) * (math.pi / 2), math.radians(85))
-                
-                nx, ny = config["normal_2d"]
-                # The 3D normal vector of the roof plane
-                normal_3d = [nx * math.sin(alpha), ny * math.sin(alpha), math.cos(alpha)]
-                
-                # Clip the mesh: keep the part 'behind' the plane
-                fused_mesh = fused_mesh.clip(normal=normal_3d, origin=config["origin"], invert=False)
-
-        # 4. Handle Flat surfaces (H code)
-        # If 'H' is active, or no slopes were defined, slice the top horizontally
-        if face_data.get("H", {}).get("active") or not sloped_active:
-            # If there are slopes, the flat part is usually at the ridge height
-            # If not, it's at the base_height
-            h_level = base_height + (2.0 if sloped_active else 0.0) 
-            fused_mesh = fused_mesh.clip(normal=[0, 0, 1], origin=[0, 0, h_level], invert=False)
-
-        # 5. Transform from Local to World Coordinates
-        # Rotate by the cv2.minAreaRect angle, then translate to the global center
-        fused_mesh.rotate_z(angle, inplace=True)
-        fused_mesh.translate([center[0], center[1], 0], inplace=True)
-
-        # 6. Add to plotter
-        pl.add_mesh(fused_mesh, color="lightblue", opacity=0.7, 
-                    show_edges=True, edge_color="steelblue", line_width=1.5)
-
-    pl.add_axes()
-    pl.show_grid(xlabel="X (m)", ylabel="Y (m)", zlabel="Z (m)")
-    pl.show()
-
-def render_3d_tiles(matched_data):
+        corners_3763 = cv2.boxPoints(rect).astype(float)     # (4,2) in EPSG:3763
+        polygon_lonlat = []
+        for x, y in corners_3763:
+            lon, lat = _to_lonlat(x, y)
+            polygon_lonlat.append([lon, lat])
+        polygon_lonlat.append(polygon_lonlat[0])              # close ring
+        records.append({
+            "polygon": polygon_lonlat,
+            "building_id": _entry_building_id(entry),
+            "code":    entry.get("code", ""),
+        })
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color=[0, 255, 136, 50],   # translucent green
+        get_line_color=[0, 204, 102, 220],
+        stroked=True,
+        filled=True,
+        extruded=False,
+        line_width_min_pixels=1,
+        pickable=True,
+    )
+ 
+ 
+def _make_roof_face_layer(matched_data) -> pdk.Layer:
     """
-    Renders buildings by iterating through the pre-computed and pre-rotated
-    3D roof polygons generated by the topology converter.
+    PyVista face intersection polygons â†’ PolygonLayer with elevation (3-D).
+ 
+    Each intersection polygon is already a PyVista PolyData whose `.points`
+    are in EPSG:3763 (x, y, z_metres).  We convert x/y to lon/lat and keep z
+    as the elevation so deck.gl renders the sloped faces in true 3-D.
+ 
+    Color scheme:
+        T (top / flat)  â†’ warm orange
+        H (hip)         â†’ warm orange
+        R / L / B       â†’ blue-grey slope faces
     """
-    pl = pv.Plotter(window_size=[1400, 900])
-    pl.set_background("white")
-    mappedcolors = {}
-    mappedcolors["T"] = "red"
-    mappedcolors["R"] = "blue"
-    mappedcolors["B"] = "green"
-    mappedcolors["L"] = "yellow"
-    mappedcolors["H"] = "black"
-    buildings_rendered = 0
-
+    _face_colors = {
+        "T": [255, 140,  40, 220],
+        "H": [255, 180,  80, 220],
+        "R": [ 80, 140, 220, 200],
+        "L": [ 80, 140, 220, 200],
+        "B": [ 80, 140, 220, 200],
+    }
+    _default_color = [160, 160, 160, 180]
+ 
+    records = []
     for entry in matched_data:
-        face_data = entry.get("face_data", {})
-        intersections = face_data.get("intersections", {})
-        osm_id = entry.get("osm_id", "Unknown")
-
-        if not intersections:
-            print(f"⚠️ Skipping OSM {osm_id} — no intersection tiles found.")
+        face_data   = entry.get("face_data", {})
+        intersections = face_data.get("intersections", {}) if face_data else {}
+        building_id = _entry_building_id(entry)
+        code = entry.get("code", {})
+        for face_name, plane in intersections.items():
+            if plane is None:
+                continue
+            raw_pts = plane.points                     # numpy (N, 3) in EPSG:3763
+            polygon_3d = []
+            for v in raw_pts.tolist():
+                lon, lat = _to_lonlat(v[0], v[1])
+                polygon_3d.append([lon, lat, float(v[2])])  # z kept as metres
+ 
+            records.append({
+                "polygon":   polygon_3d,
+                "elevation": float(raw_pts[:, 2].mean()),   # centroid height for tooltip
+                "face":      face_name,
+                "building_id": building_id,
+                "code" :   code ,
+                "color":     _face_colors.get(face_name, _default_color),
+            })
+ 
+    return pdk.Layer(
+        "PolygonLayer",
+        records,
+        get_polygon="polygon",
+        get_fill_color="color",
+        get_elevation=0,        # elevation is baked into the polygon z-coords
+        extruded=False,         # False because z is already in the vertices
+        stroked=True,
+        filled=True,
+        line_width_min_pixels=1,
+        get_line_color=[255, 255, 255, 180],
+        pickable=True,
+        auto_highlight=True,
+    )
+ 
+ 
+def _make_topology_line_layer(matched_data) -> pdk.Layer:
+    """
+    Roof ridge / valley topology lines â†’ PathLayer.
+    Each entry has "lines_world": list of [[x0,y0], [x1,y1]] in EPSG:3763.
+    """
+    records = []
+    for entry in matched_data:
+        building_id = _entry_building_id(entry)
+        lines_world = entry.get("lines_world", [])
+        for seg in lines_world:
+            p0, p1 = seg
+            lon0, lat0 = _to_lonlat(p0[0], p0[1])
+            lon1, lat1 = _to_lonlat(p1[0], p1[1])
+            records.append({
+                "path":   [[lon0, lat0], [lon1, lat1]],
+                "building_id": building_id,
+            })
+ 
+    return pdk.Layer(
+        "PathLayer",
+        records,
+        get_path="path",
+        get_color=[255, 255, 255, 230],
+        get_width=0.3,          # metres
+        width_min_pixels=2,
+        pickable=True,
+    )
+ 
+ 
+# â”€â”€ view-state helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ 
+def _center_view(matched_data, geojson_fc):
+    """Compute a sensible initial ViewState from the data bounding box."""
+    lons, lats = [], []
+ 
+    # pull coords from matched_data bounding boxes
+    import cv2
+    for entry in matched_data:
+        rect = entry.get("roof_planes")
+        if rect is None:
             continue
+        for x, y in cv2.boxPoints(rect).astype(float):
+            lon, lat = _to_lonlat(x, y)
+            lons.append(lon); lats.append(lat)
+ 
+    # fallback: use OSM footprint centroids
+    if not lons:
+        for feat in geojson_fc.get("features", []):
+            coords = feat["geometry"]["coordinates"][0]
+            for lon, lat in coords:
+                lons.append(lon); lats.append(lat)
+ 
+    if not lons:
+        return pdk.ViewState(latitude=38.712, longitude=-9.142, zoom=18, pitch=45)
+ 
+    return pdk.ViewState(
+        latitude=sum(lats) / len(lats),
+        longitude=sum(lons) / len(lons),
+        zoom=18,
+        pitch=45,
+        bearing=0,
+        max_zoom=22,
+    )
+ 
+  
+def render_pydeck(
+    geojson_fc,
+    matched_data,
+    out_path="3d_roofs.html",
+    map_style="dark",   # "dark" | "light" | "satellite" | "road"
+):
+    """
+    Build a pydeck Deck with four layers and write it to `out_path`.
+ 
+    Layers (bottom â†’ top):
+        1. GeoJsonLayer   â€“ OSM footprints (extruded reference boxes)
+        2. PolygonLayer   â€“ Oriented min-bounding boxes
+        3. PolygonLayer   â€“ Roof face intersections (PyVista planes)
+        4. PathLayer      â€“ Topology ridge/valley lines
+    """
+    _map_styles = {
+        "dark":  pdk.map_styles.DARK,
+        "light": pdk.map_styles.LIGHT,
+        "road":  pdk.map_styles.ROAD,
+    }
+ 
+    layers = [
+        _make_geojson_layer(geojson_fc),        # 1. extruded 3D reference boxes
+        _make_osm_outline_layer(geojson_fc),    # 2. flat cyan footprint outline (street level)
+        _make_bounding_box_layer(matched_data), # 3. oriented min-bounding boxes
+        _make_roof_face_layer(matched_data),    # 4. roof face intersections (PyVista planes)
+        _make_topology_line_layer(matched_data),# 5. topology ridge/valley lines
+    ]
+ 
+    view_state = _center_view(matched_data, geojson_fc)
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        map_provider="carto",
+        map_style=_map_styles.get(map_style, pdk.map_styles.ROAD),
+        tooltip={
+            "html": (
+                "<b>Building {building_id}</b><br/>"
+                "Face: {face} | Code: {code}<br/>"
+                "Elevation: {elevation:.1f} m"
+            ),
+            "style": {"backgroundColor": "rgba(0,0,0,0.7)", "color": "white"},
+        },
+    )
+ 
+    deck.to_html(out_path)
+    print(f"âœ…  pydeck map saved â†’ {out_path}")
 
-        buildings_rendered += 1
+    html_str = deck.to_html(as_string=True)
+    # Escape for srcdoc attribute
+    html_escaped = html_str.replace("&", "&amp;").replace('"', "&quot;")
+    return f'<iframe srcdoc="{html_escaped}" style="width:100%; height:600px; border:none; border-radius:12px;" sandbox="allow-scripts allow-same-origin"></iframe>'
 
-        # Iterate through each ready-made 3D roof tile and add it to the scene
-        for face_name, tile_mesh in intersections.items():
-            if tile_mesh is not None:
-                pl.add_mesh(
-                    tile_mesh.delaunay_2d(), 
-                    style="surface",
-                    color=mappedcolors[face_name], 
+_IFRAME_SRCDOC = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>
+<link rel='stylesheet' href='https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css'/>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body, #map { width:100%; height:100%; }
+</style>
+</head>
+<body>
+<div id='map'></div>
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script src='https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js'></script>
+<script>
+  var map = L.map('map').setView([38.7167, -9.1333], 14);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    maxZoom: 19
+  }).addTo(map);
+
+  var drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  var drawControl = new L.Control.Draw({
+    draw: {
+      rectangle: { shapeOptions: { color:'#3b82f6', weight:2, fillOpacity:0.12 } },
+      polygon: false, circle: false, marker: false,
+      circlemarker: false, polyline: false
+    },
+    edit: { featureGroup: drawnItems }
+  });
+  map.addControl(drawControl);
+
+  function sendBbox(bounds) {
+    window.parent.postMessage({
+      type: 'bbox',
+      data: {
+        north: bounds.getNorth(), south: bounds.getSouth(),
+        east:  bounds.getEast(),  west:  bounds.getWest()
+      }
+    }, '*');
+  }
+
+  map.on(L.Draw.Event.CREATED, function(e) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    sendBbox(e.layer.getBounds());
+  });
+  map.on(L.Draw.Event.EDITED, function(e) {
+    e.layers.eachLayer(function(l) { sendBbox(l.getBounds()); });
+  });
+  map.on(L.Draw.Event.DELETED, function() {
+    window.parent.postMessage({ type: 'bbox', data: null }, '*');
+  });
+</script>
+</body>
+</html>
+""".replace('"', '&quot;').replace("'", "&#39;")  # escape for srcdoc attribute
+
+SELECTION_MAP_HTML = f"""
+<iframe
+  srcdoc="{_IFRAME_SRCDOC}"
+  style="width:100%; height:460px; border:1px solid #1a2540;
+         border-radius:10px; display:block;"
+  sandbox="allow-scripts allow-same-origin"
+  allowfullscreen>
+</iframe>
+"""
+
+# Injected after the full Gradio DOM is ready via demo.load(js=...)
+_BBOX_LISTENER_JS = """
+() => {
+    if (window._bboxListenerAdded) return;
+    window._bboxListenerAdded = true;
+    window.addEventListener('message', function(ev) {
+        if (!ev.data || ev.data.type !== 'bbox') return;
+        var el = document.querySelector('#bbox-bridge textarea');
+        if (!el) return;
+        el.value = ev.data.data ? JSON.stringify(ev.data.data) : '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+}
+"""
+
+_EMPTY_MAP = """
+<div style="
+    height:560px; display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+    background:#060c1a; border-radius:12px;
+    border:1px solid #1a2540; gap:14px;
+">
+  <svg width='52' height='52' viewBox='0 0 24 24' fill='none'
+       stroke='#1e3a5f' stroke-width='1.2' stroke-linecap='round'>
+    <rect x='2' y='2' width='20' height='20' rx='3'/>
+    <path d='M2 9h20M9 21V9'/>
+  </svg>
+  <span style='color:#334155; font-family:monospace; font-size:12px;
+               letter-spacing:0.05em; text-align:center; line-height:1.8;'>
+    â‘  Draw a rectangle on the map<br>â‘¡ Set thresholds<br>â‘¢ Click Run Detection
+  </span>
+</div>
+"""
+
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+body, .gradio-container { background:#060c1a !important; }
+.gradio-container {
+    max-width:1500px !important;
+    font-family:'JetBrains Mono', monospace !important;
+}
+#hdr { padding:28px 0 18px; border-bottom:1px solid #1a2540; margin-bottom:18px; }
+#hdr h1 { font-size:20px !important; font-weight:700 !important;
+           color:#e2e8f0 !important; letter-spacing:-0.02em; margin:0 !important; }
+#hdr p  { color:#475569 !important; font-size:11px !important;
+           margin:4px 0 0 !important; text-transform:uppercase; letter-spacing:0.08em; }
+#left-panel { background:#0c1525; border:1px solid #1a2540;
+               border-radius:12px; padding:20px; }
+.slabel { color:#475569; font-size:10px; text-transform:uppercase;
+          letter-spacing:0.1em; margin:18px 0 8px;
+          border-top:1px solid #1a2540; padding-top:14px; display:block; }
+#bbox-bridge textarea {
+    background:#060d1e !important; border:1px solid #1e3a5f !important;
+    border-radius:8px !important; color:#38bdf8 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    font-size:11px !important; resize:none !important; }
+input[type=range] { accent-color:#3b82f6 !important; }
+label { color:#94a3b8 !important; font-size:11px !important;
+        text-transform:uppercase; letter-spacing:0.07em; }
+#run-btn {
+    background:linear-gradient(135deg,#2563eb,#1d4ed8) !important;
+    border:none !important; border-radius:8px !important;
+    color:white !important; font-weight:700 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    letter-spacing:0.06em; height:46px !important;
+    box-shadow:0 4px 20px rgba(37,99,235,0.35) !important; }
+#run-btn:hover { background:linear-gradient(135deg,#1d4ed8,#1e40af) !important; }
+#run-btn:disabled { opacity:0.35 !important; }
+#log-box textarea {
+    background:#040a14 !important; border:1px solid #1a2540 !important;
+    border-radius:8px !important; color:#4ade80 !important;
+    font-family:'JetBrains Mono',monospace !important;
+    font-size:11px !important; line-height:1.75 !important; resize:none !important; }
+#map-panel { border-radius:12px; overflow:hidden; }
+#map-panel iframe { border-radius:12px; border:none; }
+"""
+
+def default_polygon_ring_from_bbox(bbox):
+    return [
+        [bbox["west"], bbox["south"]],
+        [bbox["east"], bbox["south"]],
+        [bbox["east"], bbox["north"]],
+        [bbox["west"], bbox["north"]],
+        [bbox["west"], bbox["south"]],
+    ]
+
+
+def extract_polygon_ring_from_geojson_obj(obj):
+    """
+    Extract a polygon ring from GeoJSON objects:
+    FeatureCollection, Feature, Polygon, MultiPolygon, or LineString.
+    """
+    geometry = obj
+    obj_type = str(obj.get("type", "")).strip() if isinstance(obj, dict) else ""
+
+    if obj_type == "FeatureCollection":
+        features = obj.get("features", [])
+        if not isinstance(features, list) or not features:
+            raise ValueError("GeoJSON FeatureCollection has no features.")
+        for feature in features:
+            geom = feature.get("geometry") if isinstance(feature, dict) else None
+            if isinstance(geom, dict) and geom.get("type") in {
+                "Polygon",
+                "MultiPolygon",
+                "LineString",
+            }:
+                geometry = geom
+                break
+        else:
+            raise ValueError(
+                "No Polygon, MultiPolygon, or LineString geometry found in FeatureCollection."
+            )
+    elif obj_type == "Feature":
+        geometry = obj.get("geometry")
+
+    if not isinstance(geometry, dict):
+        raise ValueError("GeoJSON geometry is missing.")
+
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Polygon":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("GeoJSON Polygon has no coordinates.")
+        ring = coordinates[0]
+    elif geometry_type == "MultiPolygon":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("GeoJSON MultiPolygon has no coordinates.")
+        first_polygon = coordinates[0]
+        if not isinstance(first_polygon, list) or not first_polygon:
+            raise ValueError("GeoJSON MultiPolygon first polygon is invalid.")
+        ring = first_polygon[0]
+    elif geometry_type == "LineString":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("GeoJSON LineString has no coordinates.")
+        ring = coordinates
+    else:
+        raise ValueError(f"Unsupported geometry type: {geometry_type}")
+
+    if not isinstance(ring, list) or len(ring) < 3:
+        raise ValueError("Polygon ring must contain at least three points.")
+    return ring
+
+
+def parse_polygon_text_to_ring(polygon_text):
+    polygon_text = polygon_text.strip()
+    if len(polygon_text) >= 2 and polygon_text[0] == "'" and polygon_text[-1] == "'":
+        polygon_text = polygon_text[1:-1].strip()
+
+    try:
+        poly_obj = json.loads(polygon_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Invalid JSON for polygon input. Use valid FeatureCollection/Feature/Polygon GeoJSON."
+        ) from exc
+
+    if isinstance(poly_obj, dict):
+        coords = extract_polygon_ring_from_geojson_obj(poly_obj)
+    elif isinstance(poly_obj, list):
+        coords = poly_obj
+    else:
+        raise ValueError("Polygon input must be either a JSON object or coordinate list.")
+
+    ring = [[float(pt[0]), float(pt[1])] for pt in coords]
+    if len(ring) < 3:
+        raise ValueError("Polygon ring must contain at least three points.")
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
+def bbox_from_polygon_ring(ring):
+    lons = [pt[0] for pt in ring]
+    lats = [pt[1] for pt in ring]
+    return {
+        "north": max(lats),
+        "south": min(lats),
+        "east": max(lons),
+        "west": min(lons),
+    }
+
+
+def run_pipeline(
+    bbox_json: str,
+    polygon_geojson_text: str,
+    building_threshold: float,
+    overlap_threshold: float,
+    progress=gr.Progress(track_tqdm=False),
+):
+    log_lines = []
+
+    def log(msg):
+        log_lines.append(msg)
+        return "\n".join(log_lines)
+
+    polygon_geojson_text = (polygon_geojson_text or "").strip()
+    if polygon_geojson_text:
+        try:
+            polygon_ring_lon_lat = parse_polygon_text_to_ring(polygon_geojson_text)
+            bbox = bbox_from_polygon_ring(polygon_ring_lon_lat)
+        except Exception as exc:
+            yield f"[warn] Could not parse polygon GeoJSON: {exc}", _EMPTY_MAP
+            return
+        yield log("[ok] Using polygon GeoJSON input."), _EMPTY_MAP
+    else:
+        if not bbox_json or bbox_json.strip() == "":
+            yield (
+                "[warn] No area selected. Draw a rectangle on the map or provide polygon GeoJSON.",
+                _EMPTY_MAP,
+            )
+            return
+        try:
+            bbox = json.loads(bbox_json)
+        except Exception:
+            yield "[warn] Could not parse bounding box JSON. Please redraw.", _EMPTY_MAP
+            return
+        polygon_ring_lon_lat = default_polygon_ring_from_bbox(bbox)
+        yield log("[info] Using map rectangle as polygon input."), _EMPTY_MAP
+
+    north = bbox["north"]
+    south = bbox["south"]
+    east = bbox["east"]
+    west = bbox["west"]
+
+    progress(0.02, desc="Converting coordinates...")
+    t = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
+    tl_x, tl_y = t.transform(west, north)
+    br_x, br_y = t.transform(east, south)
+    area_m2 = abs(br_x - tl_x) * abs(tl_y - br_y)
+    yield log(f"[info] Area: {area_m2 / 1e6:.4f} km2"), _EMPTY_MAP
+    yield log("[ok] EPSG:4326 -> EPSG:3763 done"), _EMPTY_MAP
+
+    progress(0.06, desc="Fetching building footprints...")
+    yield log("[info] Loading scenario zone.shp buildings and filtering by polygon..."), _EMPTY_MAP
+    try:
+        geojson = build_cea_ordered_buildings_geojson(polygon_ring_lon_lat)
+        yield log(f"[ok] CEA ordering done - {len(geojson['features'])} footprint(s)"), _EMPTY_MAP
+    except Exception as exc:
+        yield log(f"[error] CEA ordering failed: {exc}"), _EMPTY_MAP
+        yield log("[error] Aborting to avoid mismatched building identifiers."), _EMPTY_MAP
+        return
+
+    if not geojson.get("features"):
+        yield log("[warn] No building footprints found in selected area."), _EMPTY_MAP
+        return
+
+    progress(0.20, desc="Connecting to WMTS...")
+    yield log("[info] Connecting to DGT WMTS satellite service..."), _EMPTY_MAP
+    wmts_url = (
+        "https://cartografia.dgterritorio.gov.pt/ortos2018/service"
+        "?service=WMTS&request=GetCapabilities"
+    )
+    wmts = WebMapTileService(wmts_url)
+    matrix = wmts.tilematrixsets["PTTM_06"].tilematrix["14"]
+    col_min, col_max, row_min, row_max = get_tile_indices(tl_x, br_y, br_x, tl_y, matrix)
+    total_tiles = (col_max + 1 - col_min) * (row_max + 1 - row_min)
+    yield log(f"[ok] Service ready - {total_tiles} tile(s) to download"), _EMPTY_MAP
+
+    def tile_cb(done, total):
+        progress(0.20 + 0.45 * (done / total), desc=f"Downloading tiles... {done}/{total}")
+
+    satellite_image, res, _ = retrieve_satelite_image(
+        (tl_x, tl_y),
+        (br_x, br_y),
+        progress_cb=tile_cb,
+    )
+    h, w = satellite_image.shape[:2]
+    Image.fromarray(satellite_image).save("satellite_image.png")
+    yield log(f"[ok] Satellite image ready ({w}x{h} px, {res:.3f} m/px)"), _EMPTY_MAP
+
+    progress(0.68, desc="Running YOLO inference...")
+    yield log(
+        (
+            f"[info] Running detector "
+            f"(conf>={building_threshold:.2f}, iou<={overlap_threshold:.2f})..."
+        )
+    ), _EMPTY_MAP
+    img_bgr = cv2.cvtColor(satellite_image, cv2.COLOR_RGB2BGR)
+    buildings = retrieve_prediction_list(
+        img_bgr,
+        (tl_x, tl_y),
+        res,
+        building_threshold,
+        overlap_threshold,
+        model,
+    )
+    total_planes = sum(len(b.planes_in_physical_dimensions) for b in buildings)
+    yield log(f"[ok] {len(buildings)} building(s), {total_planes} roof plane(s)"), _EMPTY_MAP
+
+    matched_data = []
+    if buildings:
+        yield log(
+            f"[info] Computing IOU matrix [{len(geojson['features'])}, {len(buildings)}]"
+        ), _EMPTY_MAP
+        iou_mat = compute_iou_matrix(geojson["features"], buildings)
+        n_features = len(geojson["features"])
+        for i, osm_feat in enumerate(geojson["features"]):
+            cea_name = str(osm_feat.get("properties", {}).get("cea_name", "")).strip()
+            if not cea_name or cea_name.lower() == "nan":
+                yield log(
+                    f"[warn] Feature index {i} has no valid CEA name. Skipping to preserve ID integrity."
+                ), _EMPTY_MAP
+                continue
+            best_match_idx = int(np.argmax(iou_mat[i, :]))
+            best_iou = float(iou_mat[i, best_match_idx])
+            yield log(
+                f"[match] Building {cea_name}: best_pred={best_match_idx}, IoU={best_iou:.4f}"
+            ), _EMPTY_MAP
+            if best_iou > 0.3:
+                pred = buildings[best_match_idx]
+                outline, orientedbox, lines_world, code, face_data = topology_converter_mine(
+                    pred.raw_roof_data, osm_feat
                 )
+                generated_faces = sorted(list(face_data.get("intersections", {}).keys()))
+                yield log(
+                    f"[assoc] Building {cea_name} -> Pred {best_match_idx} | code={code} | faces={generated_faces}"
+                ), _EMPTY_MAP
+                matched_data.append(
+                    {
+                        "building_id": cea_name,
+                        "cea_name": cea_name,
+                        "osm_id": osm_feat.get("properties", {}).get("osm_id"),
+                        "footprint": outline,
+                        "roof_planes": orientedbox,
+                        "lines_world": lines_world,
+                        "code": code,
+                        "face_data": face_data,
+                    }
+                )
+            else:
+                yield log(f"[skip] Building {cea_name}: rejected (IoU <= 0.3)"), _EMPTY_MAP
+            if i % 5 == 0 or i == n_features - 1:
+                progress(0.70 + 0.10 * ((i + 1) / max(1, n_features)), desc=f"Matching... {i+1}/{n_features}")
+                yield log(f"[info] Matching {i+1}/{n_features} - {len(matched_data)} matched"), _EMPTY_MAP
+    else:
+        yield log("[warn] No model predictions found. Skipping matching and roof export."), _EMPTY_MAP
 
-    print(f"🗺️ Rendering {buildings_rendered} buildings in PyVista...")
+    export_roof_surfaces_geojson(matched_data, output_path="roof.geojson")
+    yield log("[ok] Roof surfaces exported to roof.geojson"), _EMPTY_MAP
 
-    pl.add_axes()
-    # Since these are in real world coordinates (EPSG:3763), the grid will reflect actual map coordinates
-    pl.show_grid(xlabel="X (m - EPSG:3763)", ylabel="Y (m - EPSG:3763)", zlabel="Z (m)")
-    pl.show()
+    map_html_folium = build_map_html(
+        geojson,
+        buildings,
+        satellite_image,
+        (tl_x, tl_y),
+        (br_x, br_y),
+        matched_data=matched_data,
+    )
+    with open("building_map.html", "w", encoding="utf-8") as f:
+        f.write(map_html_folium)
+    yield log("[ok] 2D map saved to building_map.html"), _EMPTY_MAP
 
-# Execute the new renderer
-render_3d_tiles(matched_data)
+    progress(0.88, desc="Rendering 3D map...")
+    yield log("[info] Compositing pydeck layers..."), _EMPTY_MAP
+    map_html = render_pydeck(geojson, matched_data)
+    progress(1.0, desc="Done")
+    yield log("[ok] Finished"), map_html
+
+
+with gr.Blocks(title="Building Topology Detector", css=CSS, theme=gr.themes.Base()) as demo:
+
+    with gr.Column(elem_id="hdr"):
+        gr.HTML("<h1>ðŸ›° Building Topology Detector</h1>")
+        gr.HTML("<p>YOLO · WMTS · GeoJSON/CEA · EPSG:3763 - draw a region or paste polygon GeoJSON</p>")
+
+    with gr.Row(equal_height=False):
+
+        with gr.Column(scale=1, min_width=340, elem_id="left-panel"):
+            gr.HTML('<span class="slabel" style="border-top:none;padding-top:0">â‘  Select Region</span>')
+            gr.HTML(SELECTION_MAP_HTML)
+
+            bbox_bridge = gr.Textbox(
+                label="Selected bounding box (WGS84 JSON)",
+                placeholder="Draw a rectangle above to populateâ€¦",
+                interactive=True, lines=2, elem_id="bbox-bridge",
+            )
+
+            polygon_geojson_input = gr.Textbox(
+                label="Polygon GeoJSON (optional)",
+                placeholder="Paste FeatureCollection / Feature / Polygon to override map rectangle",
+                interactive=True,
+                lines=6,
+            )
+
+            gr.HTML('<span class="slabel">â‘¡ Detection Parameters</span>')
+            building_slider = gr.Slider(0.10, 0.95, step=0.05, value=0.50,
+                                        label="Building Confidence Threshold")
+            overlap_slider  = gr.Slider(0.10, 0.95, step=0.05, value=0.50,
+                                        label="Overlap (IoU) Threshold")
+
+            run_btn = gr.Button("â–¶  Run Detection", variant="primary", elem_id="run-btn")
+
+            gr.HTML('<span class="slabel">â‘¢ Progress Log</span>')
+            log_box = gr.Textbox(label="", interactive=False, lines=10, max_lines=10,
+                                 placeholder="Logs will stream hereâ€¦", elem_id="log-box")
+
+        with gr.Column(scale=3, elem_id="map-panel"):
+            map_display = gr.HTML(value=_EMPTY_MAP)
+
+    run_btn.click(
+        fn=run_pipeline,
+        inputs=[bbox_bridge, polygon_geojson_input, building_slider, overlap_slider],
+        outputs=[log_box, map_display],
+    )
+    demo.load(fn=None, js=_BBOX_LISTENER_JS)
+
+demo.launch()

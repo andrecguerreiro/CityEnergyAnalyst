@@ -1,71 +1,70 @@
-﻿# Ultralytics Roof Export
+# Ultralytics Roof Export
 
 ## Main API
-- `build_cea_ordered_buildings_geojson(polygon_ring_lon_lat) -> dict` - Build CEA-ordered building footprints (`cea_name` like `B1000`) from an input polygon.
-- `extract_polygon_ring_from_geojson_obj(obj) -> list[list[float]]` - Parse ring coordinates from FeatureCollection / Feature / Polygon / MultiPolygon / LineString.
-- `parse_polygon_from_args() -> tuple[dict, list[list[float]]]` - Parse polygon input and return `(bbox, closed_ring_lon_lat)`.
-- `compute_iou_matrix(osm_buildings, predictions) -> np.ndarray` - Compute IoU matrix between building footprints and detector boxes.
-- `export_roof_surfaces_geojson(matched_data, output_path="roof.geojson", source_crs="EPSG:3763", target_crs="EPSG:32629") -> dict` - Export one roof feature per face with `properties.building` set to CEA name.
+- `build_cea_ordered_buildings_geojson(polygon_ring_lon_lat) -> dict` - Load authoritative CEA footprints from scenario `zone.shp`, filter by polygon intersection, and return GeoJSON with `properties.cea_name` from `zone.shp:name`.
+- `parse_polygon_text_to_ring(polygon_text) -> list[list[float]]` - Parse pasted GeoJSON text (or raw coord list) into a closed lon/lat ring.
+- `compute_iou_matrix(osm_buildings, predictions) -> np.ndarray` - Compute IoU matrix between footprint boxes and model predictions.
+- `export_roof_surfaces_geojson(matched_data, output_path="roof_surfaces.geojson", source_crs="EPSG:3763", target_crs="EPSG:32629") -> dict` - Export one roof feature per matched roof-face tile.
 
 ## Key Patterns
-### ✅ DO: Keep CEA naming as single source of truth for roof export
+### DO: Use scenario `zone.shp` as identifier source of truth
 ```python
-geojson = build_cea_ordered_buildings_geojson(polygon_ring_lon_lat)
-cea_name = osm_feat["properties"]["cea_name"]
-matched_data.append({"cea_name": cea_name, ...})
+ZONE_SHP_PATH = r"C:\Users\Andre\cea-scenarios\test-tilt\scenario\inputs\building-geometry\zone.shp"
+zone_df = gpd.read_file(ZONE_SHP_PATH).to_crs("EPSG:4326")
+cea_name = row["name"]  # exact CEA name from zone.shp
 ```
 
-### ✅ DO: Keep IoU matching logic unchanged when only IDs are being refactored
+### DO: Filter footprints by intersects(selected_polygon)
 ```python
-iou_mat = compute_iou_matrix(geojson["features"], buildings)
-best_match_idx = np.argmax(iou_mat[i, :])
+selected_polygon = Polygon(ring_lon_lat)
+zone_df = zone_df[zone_df.intersects(selected_polygon)]
 ```
 
-### ✅ DO: Export CEA names in roof features
+### DO: Keep exactly one footprint per CEA name
 ```python
-building_id = str(entry.get("cea_name", "")).strip() or "unknown"
+zone_df = zone_df.dissolve(by="name", as_index=False)
+polygon = geom if geom.geom_type == "Polygon" else max(geom.geoms, key=lambda g: g.area)
 ```
 
-### ✅ DO: Accept ucea-style GeoJSON input paths
+### DO: Keep matching IDs strict and stable
 ```python
-# One-argument GeoJSON text
---polygon-geojson "<FeatureCollection JSON>"
-
-# Read JSON from stdin
-Get-Content polygon.geojson | python fixedbox_html_geojson.py --polygon-stdin
+cea_name = str(feature["properties"].get("cea_name", "")).strip()
+if not cea_name:
+    continue
+matched_data.append({"building_id": cea_name, "cea_name": cea_name, ...})
 ```
 
-### ✅ DO: Prompt interactively when no polygon args are provided
+### DO: Keep roof export IDs aligned to matched CEA names
 ```python
-# No args -> script asks for GeoJSON text or a file path
-python fixedbox_html_geojson.py
+building_id = _entry_building_id(entry, fallback="unknown")
+properties = {"building": building_id, "roof_id": str(roof_counter)}
 ```
 
-### ✅ DO: Keep console output ASCII-safe and current API usage
+### DO: Export roof surfaces from tiled workflow
 ```python
-roof_prediction=np.asarray(...)
-pl.show_grid(xtitle=..., ytitle=..., ztitle=...)
+export_roof_surfaces_geojson(matched_data, output_path="roof_surfaces.geojson")
 ```
 
-### ❌ DON'T: Write OSM IDs to `properties.building` in `roof.geojson`
+### DON'T: Recompute or renumber building IDs in fixedbox
 ```python
-# Avoid
-properties = {"building": osm_id}
+# Avoid in this workflow:
+cea_name = f"B{i + 1000}"
 ```
 
-### ❌ DON'T: Re-introduce bbox-only OSM fetch for matching
+### DON'T: Fall back to bbox OSM fetch for CEA-ID-sensitive runs
 ```python
-# Avoid for ID alignment
-geojson = get_osm_buildings_cached((tl_x, tl_y), (br_x, br_y))
+# Avoid:
+geojson = get_osm_buildings((tl_x, tl_y), (br_x, br_y))
 ```
 
 ## Data Contracts
 - `geojson["features"][i]["properties"]` must include:
-  - `cea_name` (required): sequential CEA building identifier (`B1000+`)
-  - `building` (optional): building category/type
-- `matched_data` entries must include:
-  - `cea_name`, `roof_planes`, `lines_world`, `code`, `face_data`
+  - `cea_name` (from `zone.shp:name`)
+  - `building` (optional, derived from available zone columns)
+- `matched_data` entries should include:
+  - `building_id`, `cea_name`, `roof_planes`, `lines_world`, `code`, `face_data`
 
 ## Related Files
-- `fixedbox_html_geojson.py` - End-to-end roof detection, topology, matching, and GeoJSON export.
-- `../cea/datamanagement/zone_helper.py` - CEA building ordering and naming pipeline (`polygon_to_zone`).
+- `fixedbox_latest.py` - Active Gradio workflow using scenario `zone.shp` as ID source.
+- `fixedboxtilingextension.py` - Tiled inference workflow now aligned to the same `zone.shp` CEA-ID matching rules.
+- `fixedbox_html_geojson.py` - Legacy CLI workflow (may differ from latest behaviour).
